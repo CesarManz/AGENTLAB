@@ -1,0 +1,18 @@
+﻿@import "tailwindcss";
+
+@layer base {
+  body {
+    background-color: #050507;
+    color: #f4f4f6;
+    font-family: "Inter", system-ui, -apple-system, sans-serif;
+  }
+
+  code, pre, .font-mono {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  }
+}
+
+.bg-dot-grid {
+  background-image: radial-gradient(#1f222a 1px, transparent 1px);
+  background-size: 20px 20px;
+}

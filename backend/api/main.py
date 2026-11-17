@@ -48,9 +48,28 @@ def create_app(db_path: str | Path = "data/agent_lab.db") -> FastAPI:
         c = get_container(request)
         return {
             "status": "ok",
-            "version": "0.4.0",
-            "agents": [a.id for a in c.agents.list_all()],
+            "version": "0.5.0",
+            "agents": [
+                {
+                    "id": a.id,
+                    "name": a.name,
+                    "role": a.role,
+                    "model_tier": a.model_tier,
+                    "allowed_tools": list(a.allowed_tools),
+                }
+                for a in c.agents.list_all()
+            ],
             "tools": [t.name for t in c.tools.list_all()],
+        }
+
+    @app.get("/sessions")
+    async def list_sessions(request: Request) -> dict[str, Any]:
+        c = get_container(request)
+        sessions = c.repo.list_sessions(limit=25)
+        pending = c.repo.list_pending_approvals()
+        return {
+            "sessions": [s.model_dump(mode="json") for s in sessions],
+            "pending_approvals": [p.model_dump(mode="json") for p in pending],
         }
 
     @app.post("/sessions")
@@ -199,5 +218,6 @@ def create_app(db_path: str | Path = "data/agent_lab.db") -> FastAPI:
 
 
 app = create_app()
+
 
 

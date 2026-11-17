@@ -76,6 +76,28 @@ class StorageRepository:
             updated_at=datetime.fromisoformat(row["updated_at"]),
         )
 
+    def list_sessions(self, limit: int = 25) -> list[TaskSession]:
+        sql = "SELECT * FROM task_sessions ORDER BY created_at DESC LIMIT ?"
+        with self.db.connect() as conn:
+            rows = conn.execute(sql, (limit,)).fetchall()
+
+        return [
+            TaskSession(
+                id=UUID(row["id"]),
+                user_prompt=row["user_prompt"],
+                status=row["status"],
+                workspace_path=row["workspace_path"],
+                blackboard=json.loads(row["blackboard_json"]),
+                use_knowledge_graph=bool(row["use_knowledge_graph"]),
+                max_budget_tokens=row["max_budget_tokens"],
+                total_tokens_used=row["total_tokens_used"],
+                final_output=row["final_output"],
+                created_at=datetime.fromisoformat(row["created_at"]),
+                updated_at=datetime.fromisoformat(row["updated_at"]),
+            )
+            for row in rows
+        ]
+
     def update_session_status(
         self,
         session_id: UUID,
@@ -435,5 +457,6 @@ class StorageRepository:
             )
 
         return entry
+
 
 
