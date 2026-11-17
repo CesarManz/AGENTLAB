@@ -1,42 +1,14 @@
-import time
+﻿import time
 from pathlib import Path
 
 from pydantic import BaseModel, Field
 
 from backend.tools.base import BaseTool
 from backend.tools.schemas import RiskLevel, ToolResult
+from backend.tools.workspace import BLOCKED_FILENAMES, INTERNAL_META_DIR, WorkspaceManager
 
 MAX_OUTPUT_CHARS = 20_000
-BLOCKED_FILENAMES = {".env", "id_rsa", "id_ed25519"}
-BLOCKED_SUFFIXES = {".pem", ".key", ".p12", ".pfx"}
-IGNORED_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules"}
-
-
-def _resolve_safe_path(workspace_path: Path, relative_path: str) -> Path:
-    """
-    Resuelve una ruta relativa dentro del workspace y bloquea escapes (path traversal)
-    o acceso a archivos sensibles.
-    """
-    base = workspace_path.resolve()
-    target = (base / relative_path).resolve()
-
-    if not target.is_relative_to(base):
-        raise PermissionError(
-            f"Acceso denegado: '{relative_path}' intenta salir del workspace permitido."
-        )
-
-    name_lower = target.name.lower()
-    if (
-        name_lower in BLOCKED_FILENAMES
-        or name_lower.startswith(".env.")
-        or target.suffix.lower() in BLOCKED_SUFFIXES
-        or ".git" in target.parts
-    ):
-        raise PermissionError(
-            f"Acceso denegado por política de seguridad al archivo sensible '{relative_path}'."
-        )
-
-    return target
+IGNORED_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules", INTERNAL_META_DIR}
 
 
 class ReadFileArgs(BaseModel):
@@ -60,9 +32,10 @@ class ReadFileTool(BaseTool):
     ) -> ToolResult:
         assert isinstance(args, ReadFileArgs)
         start = time.perf_counter()
+        ws = WorkspaceManager(workspace_path)
 
         try:
-            target = _resolve_safe_path(workspace_path, args.path)
+            target = ws.resolve_path(args.path)
             if not target.exists():
                 raise FileNotFoundError(f"El archivo '{args.path}' no existe en el workspace.")
             if not target.is_file():
@@ -115,20 +88,21 @@ class ListFilesTool(BaseTool):
     ) -> ToolResult:
         assert isinstance(args, ListFilesArgs)
         start = time.perf_counter()
+        ws = WorkspaceManager(workspace_path)
 
         try:
-            target_dir = _resolve_safe_path(workspace_path, args.subpath)
+            target_dir = ws.resolve_path(args.subpath)
             if not target_dir.exists() or not target_dir.is_dir():
                 raise FileNotFoundError(f"El directorio '{args.subpath}' no existe en el workspace.")
 
-            base = workspace_path.resolve()
             entries: list[str] = []
             for item in sorted(target_dir.rglob("*")):
-                if any(part in IGNORED_DIRS for part in item.parts):
+                rel_parts = item.relative_to(ws.root).parts
+                if any(part in IGNORED_DIRS for part in rel_parts):
                     continue
                 if item.name.lower() in BLOCKED_FILENAMES or item.name.lower().startswith(".env."):
                     continue
-                rel = item.relative_to(base).as_posix()
+                rel = ws.to_relative_posix(item)
                 entries.append(f"{rel}/" if item.is_dir() else rel)
 
             output = "\n".join(entries) if entries else "(El workspace está vacío)"
@@ -147,5 +121,139 @@ class ListFilesTool(BaseTool):
                 tool_name=self.name,
                 status="error",
                 output=f"Error al listar '{args.subpath}': {exc}",
+                execution_time_ms=elapsed_ms,
+            )
+
+
+class WriteFileArgs(BaseModel):
+    path: str = Field(
+        min_length=1,
+        description="Ruta relativa dentro del workspace donde crear o sobrescribir el archivo.",
+    )
+    content: str = Field(
+        description="Contenido completo de texto UTF-8 que se escribirá en el archivo.",
+    )
+
+
+class WriteFileTool(BaseTool):
+    name = "write_file"
+    description = "Crea un archivo nuevo o sobrescribe uno existente dentro del workspace (genera respaldo previo si existía)."
+    args_schema = WriteFileArgs
+    risk_level: RiskLevel = "moderate"
+
+    async def execute(
+        self,
+        tool_call_id: str,
+        args: BaseModel,
+        workspace_path: Path,
+    ) -> ToolResult:
+        assert isinstance(args, WriteFileArgs)
+        start = time.perf_counter()
+        ws = WorkspaceManager(workspace_path)
+
+        try:
+            target = ws.resolve_path(args.path)
+            if target.exists() and target.is_dir():
+                raise IsADirectoryError(f"'{args.path}' es un directorio, no se puede sobrescribir como archivo.")
+
+            existed = target.exists()
+            backup = ws.create_backup(target)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(args.content, encoding="utf-8")
+
+            rel_path = ws.to_relative_posix(target)
+            action = "sobrescrito" if existed else "creado"
+            backup_note = f" (respaldo en {ws.to_relative_posix(backup)})" if backup else ""
+            elapsed_ms = int((time.perf_counter() - start) * 1000)
+
+            return ToolResult(
+                tool_call_id=tool_call_id,
+                tool_name=self.name,
+                status="success",
+                output=f"Archivo '{rel_path}' {action} correctamente ({len(args.content)} caracteres){backup_note}.",
+                execution_time_ms=elapsed_ms,
+                artifacts_created=[rel_path],
+            )
+        except Exception as exc:
+            elapsed_ms = int((time.perf_counter() - start) * 1000)
+            return ToolResult(
+                tool_call_id=tool_call_id,
+                tool_name=self.name,
+                status="error",
+                output=f"Error al escribir '{args.path}': {exc}",
+                execution_time_ms=elapsed_ms,
+            )
+
+
+class EditFileArgs(BaseModel):
+    path: str = Field(
+        min_length=1,
+        description="Ruta relativa dentro del workspace del archivo existente a modificar.",
+    )
+    old_text: str = Field(
+        min_length=1,
+        description="Fragmento exacto de texto actual que debe ser reemplazado (debe aparecer una única vez).",
+    )
+    new_text: str = Field(
+        description="Nuevo fragmento de texto que reemplazará a old_text.",
+    )
+
+
+class EditFileTool(BaseTool):
+    name = "edit_file"
+    description = "Reemplaza un bloque exacto y único de texto dentro de un archivo existente en el workspace."
+    args_schema = EditFileArgs
+    risk_level: RiskLevel = "moderate"
+
+    async def execute(
+        self,
+        tool_call_id: str,
+        args: BaseModel,
+        workspace_path: Path,
+    ) -> ToolResult:
+        assert isinstance(args, EditFileArgs)
+        start = time.perf_counter()
+        ws = WorkspaceManager(workspace_path)
+
+        try:
+            target = ws.resolve_path(args.path)
+            if not target.exists() or not target.is_file():
+                raise FileNotFoundError(f"El archivo '{args.path}' no existe en el workspace.")
+
+            current_content = target.read_text(encoding="utf-8")
+            occurrences = current_content.count(args.old_text)
+
+            if occurrences == 0:
+                raise ValueError(
+                    f"No se encontró el bloque 'old_text' exacto dentro de '{args.path}'. Lee el archivo primero para verificar su contenido."
+                )
+            if occurrences > 1:
+                raise ValueError(
+                    f"El bloque 'old_text' aparece {occurrences} veces en '{args.path}'. Proporciona más contexto para que sea único."
+                )
+
+            backup = ws.create_backup(target)
+            updated_content = current_content.replace(args.old_text, args.new_text, 1)
+            target.write_text(updated_content, encoding="utf-8")
+
+            rel_path = ws.to_relative_posix(target)
+            backup_note = f" (respaldo en {ws.to_relative_posix(backup)})" if backup else ""
+            elapsed_ms = int((time.perf_counter() - start) * 1000)
+
+            return ToolResult(
+                tool_call_id=tool_call_id,
+                tool_name=self.name,
+                status="success",
+                output=f"Archivo '{rel_path}' editado correctamente{backup_note}.",
+                execution_time_ms=elapsed_ms,
+                artifacts_created=[rel_path],
+            )
+        except Exception as exc:
+            elapsed_ms = int((time.perf_counter() - start) * 1000)
+            return ToolResult(
+                tool_call_id=tool_call_id,
+                tool_name=self.name,
+                status="error",
+                output=f"Error al editar '{args.path}': {exc}",
                 execution_time_ms=elapsed_ms,
             )

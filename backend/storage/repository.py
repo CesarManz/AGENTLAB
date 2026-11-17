@@ -1,4 +1,4 @@
-import json
+﻿import json
 from datetime import datetime, timezone
 from uuid import UUID
 
@@ -139,6 +139,54 @@ class StorageRepository:
             )
         return run
 
+    def get_run(self, run_id: UUID) -> AgentRun | None:
+        sql = "SELECT * FROM agent_runs WHERE id = ?"
+        with self.db.connect() as conn:
+            row = conn.execute(sql, (str(run_id),)).fetchone()
+
+        if row is None:
+            return None
+
+        return AgentRun(
+            id=UUID(row["id"]),
+            session_id=UUID(row["session_id"]),
+            parent_run_id=UUID(row["parent_run_id"]) if row["parent_run_id"] else None,
+            dag_node_id=row["dag_node_id"],
+            agent_id=row["agent_id"],
+            task_instruction=row["task_instruction"],
+            active_skills=json.loads(row["active_skills_json"]),
+            status=row["status"],
+            current_step=row["current_step"],
+            result_summary=row["result_summary"],
+            error_message=row["error_message"],
+            started_at=datetime.fromisoformat(row["started_at"]) if row["started_at"] else None,
+            completed_at=datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None,
+        )
+
+    def list_runs_for_session(self, session_id: UUID) -> list[AgentRun]:
+        sql = "SELECT * FROM agent_runs WHERE session_id = ? ORDER BY rowid ASC"
+        with self.db.connect() as conn:
+            rows = conn.execute(sql, (str(session_id),)).fetchall()
+
+        return [
+            AgentRun(
+                id=UUID(row["id"]),
+                session_id=UUID(row["session_id"]),
+                parent_run_id=UUID(row["parent_run_id"]) if row["parent_run_id"] else None,
+                dag_node_id=row["dag_node_id"],
+                agent_id=row["agent_id"],
+                task_instruction=row["task_instruction"],
+                active_skills=json.loads(row["active_skills_json"]),
+                status=row["status"],
+                current_step=row["current_step"],
+                result_summary=row["result_summary"],
+                error_message=row["error_message"],
+                started_at=datetime.fromisoformat(row["started_at"]) if row["started_at"] else None,
+                completed_at=datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None,
+            )
+            for row in rows
+        ]
+
     def update_run_state(
         self,
         run_id: UUID,
@@ -233,9 +281,33 @@ class StorageRepository:
             )
         return messages
 
+    def get_next_sequence(self, run_id: UUID) -> int:
+        sql = "SELECT COALESCE(MAX(sequence), -1) + 1 AS next_seq FROM messages WHERE run_id = ?"
+        with self.db.connect() as conn:
+            row = conn.execute(sql, (str(run_id),)).fetchone()
+        return int(row["next_seq"]) if row else 0
+
     # -------------------------------------------------------------------------
     # ToolExecutions
     # -------------------------------------------------------------------------
+
+    def _row_to_tool_execution(self, row: object) -> ToolExecution:
+        r = row  # type: ignore[assignment]
+        return ToolExecution(
+            id=UUID(r["id"]),
+            tool_call_id=r["tool_call_id"],
+            run_id=UUID(r["run_id"]),
+            session_id=UUID(r["session_id"]),
+            tool_name=r["tool_name"],
+            arguments=json.loads(r["arguments_json"]),
+            risk_level=r["risk_level"],
+            status=r["status"],
+            output=r["output"],
+            execution_time_ms=r["execution_time_ms"],
+            artifacts_created=json.loads(r["artifacts_created_json"]),
+            created_at=datetime.fromisoformat(r["created_at"]),
+            updated_at=datetime.fromisoformat(r["updated_at"]),
+        )
 
     def save_tool_execution(self, execution: ToolExecution) -> ToolExecution:
         sql = """
@@ -271,6 +343,32 @@ class StorageRepository:
                 ),
             )
         return execution
+
+    def get_tool_execution(self, execution_id: UUID) -> ToolExecution | None:
+        sql = "SELECT * FROM tool_executions WHERE id = ?"
+        with self.db.connect() as conn:
+            row = conn.execute(sql, (str(execution_id),)).fetchone()
+        return self._row_to_tool_execution(row) if row else None
+
+    def list_pending_approvals(self, session_id: UUID | None = None) -> list[ToolExecution]:
+        if session_id is not None:
+            sql = """
+            SELECT * FROM tool_executions
+            WHERE status = 'awaiting_approval' AND session_id = ?
+            ORDER BY created_at ASC
+            """
+            params: tuple[str, ...] = (str(session_id),)
+        else:
+            sql = """
+            SELECT * FROM tool_executions
+            WHERE status = 'awaiting_approval'
+            ORDER BY created_at ASC
+            """
+            params = ()
+
+        with self.db.connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._row_to_tool_execution(r) for r in rows]
 
     # -------------------------------------------------------------------------
     # TokenLedger (Append-only + incremento atómico en TaskSession)
@@ -319,3 +417,4 @@ class StorageRepository:
             )
 
         return entry
+

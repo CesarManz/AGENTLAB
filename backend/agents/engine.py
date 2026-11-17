@@ -1,4 +1,4 @@
-from collections.abc import Callable
+﻿from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID
@@ -8,7 +8,7 @@ from backend.agents.schemas import AgentConfig, AgentRun, TaskSession
 from backend.core.config import ModelRoute, resolve_model_route
 from backend.core.events import EventBus, SystemEvent
 from backend.providers.base import BaseProvider
-from backend.providers.schemas import Message
+from backend.providers.schemas import Message, ToolCall
 from backend.storage.repository import StorageRepository
 from backend.storage.schemas import TokenLedgerEntry
 from backend.tools.registry import ToolRegistry
@@ -24,7 +24,7 @@ ProviderFactory = Callable[[ModelRoute], BaseProvider]
 
 class AgentEngine:
     """
-    Motor unitario de ejecución de agentes (v0.2).
+    Motor unitario de ejecución de agentes con soporte Human-in-the-Loop (v0.3).
     Agnóstico a proveedores concretos, FastAPI y frameworks externos.
     """
 
@@ -43,9 +43,12 @@ class AgentEngine:
         self.events = event_bus
         self.provider_factory = provider_factory
 
+    def _requires_approval(self, risk_level: str) -> bool:
+        return risk_level != "safe"
+
     async def execute_session(self, session: TaskSession, agent_id: str) -> AgentRun:
         """
-        Ejecuta un flujo vertical completo de un agente sobre una TaskSession.
+        Inicia una nueva TaskSession desde cero con el agente indicado.
         """
         config = self.agents.get(agent_id)
         workspace = Path(session.workspace_path).resolve()
@@ -79,6 +82,160 @@ class AgentEngine:
             )
         )
 
+        initial_msg = Message(
+            run_id=run.id,
+            session_id=session.id,
+            sequence=0,
+            role="user",
+            content=run.task_instruction,
+        )
+        self.repo.append_message(initial_msg)
+
+        return await self._run_loop(session=session, run=run, config=config, workspace=workspace)
+
+    async def resolve_approval(self, execution_id: UUID, *, approved: bool) -> AgentRun:
+        """
+        Aprueba o rechaza una ToolExecution en estado 'pending_approval',
+        procesa las llamadas restantes del turno y reanuda el AgentRun.
+        """
+        execution = self.repo.get_tool_execution(execution_id)
+        if execution is None:
+            raise KeyError(f"No se encontró la ejecución de herramienta {execution_id}")
+        if execution.status != "awaiting_approval":
+            raise ValueError(
+                f"La ejecución {execution_id} no espera aprobación (estado actual: {execution.status})."
+            )
+
+        run = self.repo.get_run(execution.run_id)
+        if run is None:
+            raise KeyError(f"No se encontró el AgentRun {execution.run_id}")
+
+        session = self.repo.get_session(execution.session_id)
+        if session is None:
+            raise KeyError(f"No se encontró la sesión {execution.session_id}")
+
+        config = self.agents.get(run.agent_id)
+        workspace = Path(session.workspace_path).resolve()
+
+        await self.events.publish(
+            SystemEvent(
+                event_type="APPROVAL_RESOLVED",
+                session_id=session.id,
+                run_id=run.id,
+                payload={
+                    "execution_id": str(execution.id),
+                    "tool_name": execution.tool_name,
+                    "approved": approved,
+                },
+            )
+        )
+
+        if approved:
+            execution.status = "running"
+            self.repo.save_tool_execution(execution)
+
+            tool = self.tools.get(execution.tool_name)
+            result = await tool.validate_and_execute(
+                execution.tool_call_id, execution.arguments, workspace
+            )
+            execution.apply_result(result)
+            self.repo.save_tool_execution(execution)
+
+            await self.events.publish(
+                SystemEvent(
+                    event_type="TOOL_CALLED",
+                    session_id=session.id,
+                    run_id=run.id,
+                    payload={
+                        "tool_name": execution.tool_name,
+                        "status": result.status,
+                        "execution_time_ms": result.execution_time_ms,
+                    },
+                )
+            )
+            tool_output = result.output
+        else:
+            execution.status = "denied_by_user"
+            execution.output = "Acción rechazada por el usuario."
+            execution.updated_at = _utc_now()
+            self.repo.save_tool_execution(execution)
+            tool_output = (
+                f"Permiso denegado por el usuario: la ejecución de '{execution.tool_name}' "
+                "fue rechazada manualmente. No vuelvas a intentarla con los mismos parámetros."
+            )
+
+        next_seq = self.repo.get_next_sequence(run.id)
+        self.repo.append_message(
+            Message(
+                run_id=run.id,
+                session_id=session.id,
+                sequence=next_seq,
+                role="tool",
+                content=tool_output,
+                tool_call_id=execution.tool_call_id,
+                tool_name=execution.tool_name,
+            )
+        )
+
+        # Reactivar estado del run y sesión
+        run.status = "running"
+        self.repo.update_run_state(run.id, status="running", current_step=run.current_step)
+        self.repo.update_session_status(session.id, status="running")
+
+        # Verificar si quedaron más tool_calls sin responder en el último turno del asistente
+        history = self.repo.list_messages(run.id)
+        pending_calls = self._find_unanswered_tool_calls(history)
+        if pending_calls:
+            paused = await self._process_tool_calls(
+                session=session,
+                run=run,
+                config=config,
+                tool_calls=pending_calls,
+                workspace=workspace,
+            )
+            if paused:
+                return run
+
+        self.repo.update_run_state(run.id, status="running", current_step=run.current_step)
+        await self.events.publish(
+            SystemEvent(
+                event_type="STEP_COMPLETED",
+                session_id=session.id,
+                run_id=run.id,
+                payload={"step": run.current_step},
+            )
+        )
+
+        return await self._run_loop(session=session, run=run, config=config, workspace=workspace)
+
+    def _find_unanswered_tool_calls(self, history: list[Message]) -> list[ToolCall]:
+        last_assistant_idx = -1
+        for idx, msg in enumerate(history):
+            if msg.role == "assistant":
+                last_assistant_idx = idx
+
+        if last_assistant_idx == -1:
+            return []
+
+        assistant_msg = history[last_assistant_idx]
+        if not assistant_msg.tool_calls:
+            return []
+
+        answered_ids = {
+            msg.tool_call_id
+            for msg in history[last_assistant_idx + 1 :]
+            if msg.role == "tool" and msg.tool_call_id
+        }
+        return [tc for tc in assistant_msg.tool_calls if tc.id not in answered_ids]
+
+    async def _run_loop(
+        self,
+        *,
+        session: TaskSession,
+        run: AgentRun,
+        config: AgentConfig,
+        workspace: Path,
+    ) -> AgentRun:
         route = resolve_model_route(
             config.model_tier,
             provider_override=config.provider_override,
@@ -87,17 +244,6 @@ class AgentEngine:
         provider = self.provider_factory(route)
 
         try:
-            sequence = 0
-            initial_msg = Message(
-                run_id=run.id,
-                session_id=session.id,
-                sequence=sequence,
-                role="user",
-                content=run.task_instruction,
-            )
-            self.repo.append_message(initial_msg)
-            sequence += 1
-
             tool_definitions = self.tools.get_definitions_for(config.allowed_tools)
 
             while run.current_step < config.max_steps:
@@ -146,16 +292,16 @@ class AgentEngine:
                     )
                 )
 
+                next_seq = self.repo.get_next_sequence(run.id)
                 assistant_msg = Message(
                     run_id=run.id,
                     session_id=session.id,
-                    sequence=sequence,
+                    sequence=next_seq,
                     role="assistant",
                     content=response.content,
                     tool_calls=response.tool_calls,
                 )
                 self.repo.append_message(assistant_msg)
-                sequence += 1
 
                 if response.finish_reason == "error":
                     return await self._fail_run(
@@ -200,29 +346,15 @@ class AgentEngine:
                     )
                     return run
 
-                # Ejecutar cada ToolCall solicitada por el modelo
-                for tc in response.tool_calls:
-                    tool_result = await self._execute_single_tool_call(
-                        session_id=session.id,
-                        run_id=run.id,
-                        config=config,
-                        tool_call_id=tc.id,
-                        tool_name=tc.tool_name,
-                        arguments=tc.arguments,
-                        workspace=workspace,
-                    )
-
-                    tool_msg = Message(
-                        run_id=run.id,
-                        session_id=session.id,
-                        sequence=sequence,
-                        role="tool",
-                        content=tool_result.output,
-                        tool_call_id=tc.id,
-                        tool_name=tc.tool_name,
-                    )
-                    self.repo.append_message(tool_msg)
-                    sequence += 1
+                paused = await self._process_tool_calls(
+                    session=session,
+                    run=run,
+                    config=config,
+                    tool_calls=list(response.tool_calls),
+                    workspace=workspace,
+                )
+                if paused:
+                    return run
 
                 self.repo.update_run_state(
                     run.id,
@@ -253,55 +385,108 @@ class AgentEngine:
         finally:
             await provider.close()
 
-    async def _execute_single_tool_call(
+    async def _process_tool_calls(
         self,
         *,
-        session_id: UUID,
-        run_id: UUID,
+        session: TaskSession,
+        run: AgentRun,
         config: AgentConfig,
-        tool_call_id: str,
-        tool_name: str,
-        arguments: dict,
+        tool_calls: list[ToolCall],
         workspace: Path,
-    ) -> ToolResult:
-        if tool_name not in config.allowed_tools:
-            return ToolResult(
-                tool_call_id=tool_call_id,
-                tool_name=tool_name,
-                status="error",
-                output=f"Permiso denegado: el agente '{config.id}' no tiene autorizada la herramienta '{tool_name}'.",
-                execution_time_ms=0,
+    ) -> bool:
+        """
+        Ejecuta una secuencia de ToolCalls. Devuelve True si se pausó esperando
+        aprobación humana (HITL), o False si todas se completaron.
+        """
+        for tc in tool_calls:
+            if tc.tool_name not in config.allowed_tools:
+                result = ToolResult(
+                    tool_call_id=tc.id,
+                    tool_name=tc.tool_name,
+                    status="error",
+                    output=f"Permiso denegado: el agente '{config.id}' no tiene autorizada la herramienta '{tc.tool_name}'.",
+                    execution_time_ms=0,
+                )
+                next_seq = self.repo.get_next_sequence(run.id)
+                self.repo.append_message(
+                    Message(
+                        run_id=run.id,
+                        session_id=session.id,
+                        sequence=next_seq,
+                        role="tool",
+                        content=result.output,
+                        tool_call_id=tc.id,
+                        tool_name=tc.tool_name,
+                    )
+                )
+                continue
+
+            tool = self.tools.get(tc.tool_name)
+            execution = ToolExecution(
+                tool_call_id=tc.id,
+                run_id=run.id,
+                session_id=session.id,
+                tool_name=tc.tool_name,
+                arguments=tc.arguments,
+                risk_level=tool.risk_level,
+                status="awaiting_approval" if self._requires_approval(tool.risk_level) else "running",
+            )
+            self.repo.save_tool_execution(execution)
+
+            if execution.status == "awaiting_approval":
+                run.status = "awaiting_approval"
+                self.repo.update_run_state(
+                    run.id,
+                    status="awaiting_approval",
+                    current_step=run.current_step,
+                )
+                self.repo.update_session_status(session.id, status="awaiting_approval")
+                await self.events.publish(
+                    SystemEvent(
+                        event_type="APPROVAL_REQUIRED",
+                        session_id=session.id,
+                        run_id=run.id,
+                        payload={
+                            "execution_id": str(execution.id),
+                            "tool_name": execution.tool_name,
+                            "risk_level": execution.risk_level,
+                            "arguments": execution.arguments,
+                        },
+                    )
+                )
+                return True
+
+            result = await tool.validate_and_execute(tc.id, tc.arguments, workspace)
+            execution.apply_result(result)
+            self.repo.save_tool_execution(execution)
+
+            await self.events.publish(
+                SystemEvent(
+                    event_type="TOOL_CALLED",
+                    session_id=session.id,
+                    run_id=run.id,
+                    payload={
+                        "tool_name": tc.tool_name,
+                        "status": result.status,
+                        "execution_time_ms": result.execution_time_ms,
+                    },
+                )
             )
 
-        tool = self.tools.get(tool_name)
-        execution = ToolExecution(
-            tool_call_id=tool_call_id,
-            run_id=run_id,
-            session_id=session_id,
-            tool_name=tool_name,
-            arguments=arguments,
-            risk_level=tool.risk_level,
-            status="running",
-        )
-        self.repo.save_tool_execution(execution)
-
-        result = await tool.validate_and_execute(tool_call_id, arguments, workspace)
-        execution.apply_result(result)
-        self.repo.save_tool_execution(execution)
-
-        await self.events.publish(
-            SystemEvent(
-                event_type="TOOL_CALLED",
-                session_id=session_id,
-                run_id=run_id,
-                payload={
-                    "tool_name": tool_name,
-                    "status": result.status,
-                    "execution_time_ms": result.execution_time_ms,
-                },
+            next_seq = self.repo.get_next_sequence(run.id)
+            self.repo.append_message(
+                Message(
+                    run_id=run.id,
+                    session_id=session.id,
+                    sequence=next_seq,
+                    role="tool",
+                    content=result.output,
+                    tool_call_id=tc.id,
+                    tool_name=tc.tool_name,
+                )
             )
-        )
-        return result
+
+        return False
 
     async def _fail_run(
         self, session_id: UUID, run: AgentRun, error_message: str
@@ -327,3 +512,4 @@ class AgentEngine:
             )
         )
         return run
+
