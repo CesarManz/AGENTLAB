@@ -1,15 +1,37 @@
+﻿from abc import ABC, abstractmethod
+from collections.abc import Sequence
+from typing import Any
 
-from abc import ABC, abstractmethod
+from backend.providers.schemas import LLMResponse, Message, ToolDefinition
 
 
 class BaseProvider(ABC):
     """
-    Contrato base para todos los proveedores de IA.
+    Contrato base agnóstico para todos los proveedores de IA en AGENT LAB.
     """
 
+    @property
     @abstractmethod
-    async def generate(self, prompt: str) -> str:
+    def provider_name(self) -> str:
+        """Identificador del proveedor (ej. 'google', 'anthropic', 'openai')."""
+        ...
+
+    @abstractmethod
+    async def generate(
+        self,
+        messages: Sequence[Message],
+        *,
+        system_instruction: str | None = None,
+        tools: Sequence[ToolDefinition] | None = None,
+        temperature: float = 0.2,
+        response_schema: dict[str, Any] | None = None,
+    ) -> LLMResponse:
         """
-        Recibe un prompt y devuelve la respuesta del modelo.
+        Ejecuta una inferencia a partir de mensajes estructurados y devuelve
+        un LLMResponse normalizado.
         """
-        pass
+        ...
+
+    async def close(self) -> None:
+        """Libera recursos o clientes HTTP abiertos por el proveedor."""
+        return None
