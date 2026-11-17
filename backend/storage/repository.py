@@ -1,4 +1,5 @@
-﻿import json
+﻿from typing import Any
+import json
 from datetime import datetime, timezone
 from uuid import UUID
 
@@ -91,6 +92,23 @@ class StorageRepository:
                 sql,
                 (status, final_output, _utc_iso(), str(session_id)),
             )
+
+    def update_blackboard(self, session_id: UUID, key: str, value: Any) -> dict[str, Any]:
+        with self.db.connect() as conn:
+            row = conn.execute(
+                "SELECT blackboard_json FROM task_sessions WHERE id = ?",
+                (str(session_id),),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"No se encontró la sesión {session_id}")
+
+            board: dict[str, Any] = json.loads(row["blackboard_json"])
+            board[key] = value
+            conn.execute(
+                "UPDATE task_sessions SET blackboard_json = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(board), _utc_iso(), str(session_id)),
+            )
+        return board
 
     def has_available_budget(self, session_id: UUID) -> bool:
         sql = """
@@ -417,4 +435,5 @@ class StorageRepository:
             )
 
         return entry
+
 

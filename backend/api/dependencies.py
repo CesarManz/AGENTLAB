@@ -2,12 +2,15 @@
 from pathlib import Path
 
 from backend.agents.engine import AgentEngine
+from backend.agents.orchestrator import MultiAgentOrchestrator
 from backend.agents.registry import AgentRegistry
 from backend.agents.schemas import AgentConfig
+from backend.api.ws import SessionConnectionManager
 from backend.core.events import EventBus
 from backend.providers.google import GoogleProvider
 from backend.storage.database import Database
 from backend.storage.repository import StorageRepository
+from backend.tools.blackboard import ReadBlackboardTool, WriteBlackboardTool
 from backend.tools.filesystem import EditFileTool, ListFilesTool, ReadFileTool, WriteFileTool
 from backend.tools.registry import ToolRegistry
 
@@ -17,9 +20,11 @@ class AppContainer:
     db: Database
     repo: StorageRepository
     events: EventBus
+    ws_manager: SessionConnectionManager
     agents: AgentRegistry
     tools: ToolRegistry
     engine: AgentEngine
+    orchestrator: MultiAgentOrchestrator
 
 
 def build_container(db_path: str | Path = "data/agent_lab.db") -> AppContainer:
@@ -27,6 +32,8 @@ def build_container(db_path: str | Path = "data/agent_lab.db") -> AppContainer:
     db.initialize()
     repo = StorageRepository(db)
     events = EventBus()
+    ws_manager = SessionConnectionManager()
+    events.subscribe("*", ws_manager.broadcast_event)
 
     agents = AgentRegistry()
     agents.register(
@@ -36,9 +43,9 @@ def build_container(db_path: str | Path = "data/agent_lab.db") -> AppContainer:
             role="Analista de Workspace",
             system_prompt=(
                 "Eres el Agente Explorador de AGENT LAB. "
-                "Usa list_files y read_file para analizar el workspace y responder con precisión."
+                "Usa list_files, read_file y write_blackboard para analizar el workspace y compartir tus hallazgos."
             ),
-            allowed_tools=("list_files", "read_file"),
+            allowed_tools=("list_files", "read_file", "read_blackboard", "write_blackboard"),
             max_steps=8,
         )
     )
@@ -49,9 +56,16 @@ def build_container(db_path: str | Path = "data/agent_lab.db") -> AppContainer:
             role="Desarrollador de Software",
             system_prompt=(
                 "Eres un programador experto en AGENT LAB. "
-                "Inspecciona el workspace antes de modificar archivos y usa write_file o edit_file con código limpio."
+                "Consulta read_blackboard y el workspace antes de crear o editar código."
             ),
-            allowed_tools=("list_files", "read_file", "write_file", "edit_file"),
+            allowed_tools=(
+                "list_files",
+                "read_file",
+                "write_file",
+                "edit_file",
+                "read_blackboard",
+                "write_blackboard",
+            ),
             max_steps=10,
         )
     )
@@ -61,6 +75,8 @@ def build_container(db_path: str | Path = "data/agent_lab.db") -> AppContainer:
     tools.register(ReadFileTool())
     tools.register(WriteFileTool())
     tools.register(EditFileTool())
+    tools.register(ReadBlackboardTool(repo))
+    tools.register(WriteBlackboardTool(repo))
 
     engine = AgentEngine(
         agent_registry=agents,
@@ -69,12 +85,19 @@ def build_container(db_path: str | Path = "data/agent_lab.db") -> AppContainer:
         event_bus=events,
         provider_factory=lambda route: GoogleProvider(model=route.model),
     )
+    orchestrator = MultiAgentOrchestrator(
+        engine=engine,
+        repository=repo,
+        event_bus=events,
+    )
 
     return AppContainer(
         db=db,
         repo=repo,
         events=events,
+        ws_manager=ws_manager,
         agents=agents,
         tools=tools,
         engine=engine,
+        orchestrator=orchestrator,
     )

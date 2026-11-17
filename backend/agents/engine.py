@@ -11,6 +11,7 @@ from backend.providers.base import BaseProvider
 from backend.providers.schemas import Message, ToolCall
 from backend.storage.repository import StorageRepository
 from backend.storage.schemas import TokenLedgerEntry
+from backend.tools.blackboard import CURRENT_SESSION_ID
 from backend.tools.registry import ToolRegistry
 from backend.tools.schemas import ToolExecution, ToolResult
 
@@ -24,8 +25,7 @@ ProviderFactory = Callable[[ModelRoute], BaseProvider]
 
 class AgentEngine:
     """
-    Motor unitario de ejecución de agentes con soporte Human-in-the-Loop (v0.3).
-    Agnóstico a proveedores concretos, FastAPI y frameworks externos.
+    Motor unitario de ejecución de agentes con soporte Human-in-the-Loop y Blackboard (v0.4).
     """
 
     def __init__(
@@ -48,9 +48,8 @@ class AgentEngine:
 
     async def execute_session(self, session: TaskSession, agent_id: str) -> AgentRun:
         """
-        Inicia una nueva TaskSession desde cero con el agente indicado.
+        Crea una nueva TaskSession en SQLite y ejecuta su AgentRun principal.
         """
-        config = self.agents.get(agent_id)
         workspace = Path(session.workspace_path).resolve()
         workspace.mkdir(parents=True, exist_ok=True)
 
@@ -64,10 +63,37 @@ class AgentEngine:
             )
         )
 
+        return await self.execute_agent_in_session(
+            session=session,
+            agent_id=agent_id,
+            task_instruction=session.user_prompt,
+        )
+
+    async def execute_agent_in_session(
+        self,
+        *,
+        session: TaskSession,
+        agent_id: str,
+        task_instruction: str,
+        parent_run_id: UUID | None = None,
+        dag_node_id: str | None = None,
+    ) -> AgentRun:
+        """
+        Ejecuta un AgentRun concreto dentro de una TaskSession ya existente
+        (usado tanto por execute_session como por MultiAgentOrchestrator).
+        """
+        config = self.agents.get(agent_id)
+        workspace = Path(session.workspace_path).resolve()
+        workspace.mkdir(parents=True, exist_ok=True)
+
+        self.repo.update_session_status(session.id, status="running")
+
         run = AgentRun(
             session_id=session.id,
+            parent_run_id=parent_run_id,
+            dag_node_id=dag_node_id,
             agent_id=config.id,
-            task_instruction=session.user_prompt,
+            task_instruction=task_instruction,
             active_skills=list(config.default_skills),
             status="running",
             started_at=_utc_now(),
@@ -78,7 +104,7 @@ class AgentEngine:
                 event_type="RUN_STARTED",
                 session_id=session.id,
                 run_id=run.id,
-                payload={"agent_id": config.id},
+                payload={"agent_id": config.id, "dag_node_id": dag_node_id},
             )
         )
 
@@ -91,11 +117,15 @@ class AgentEngine:
         )
         self.repo.append_message(initial_msg)
 
-        return await self._run_loop(session=session, run=run, config=config, workspace=workspace)
+        token = CURRENT_SESSION_ID.set(session.id)
+        try:
+            return await self._run_loop(session=session, run=run, config=config, workspace=workspace)
+        finally:
+            CURRENT_SESSION_ID.reset(token)
 
     async def resolve_approval(self, execution_id: UUID, *, approved: bool) -> AgentRun:
         """
-        Aprueba o rechaza una ToolExecution en estado 'pending_approval',
+        Aprueba o rechaza una ToolExecution en estado 'awaiting_approval',
         procesa las llamadas restantes del turno y reanuda el AgentRun.
         """
         execution = self.repo.get_tool_execution(execution_id)
@@ -117,96 +147,98 @@ class AgentEngine:
         config = self.agents.get(run.agent_id)
         workspace = Path(session.workspace_path).resolve()
 
-        await self.events.publish(
-            SystemEvent(
-                event_type="APPROVAL_RESOLVED",
-                session_id=session.id,
-                run_id=run.id,
-                payload={
-                    "execution_id": str(execution.id),
-                    "tool_name": execution.tool_name,
-                    "approved": approved,
-                },
-            )
-        )
-
-        if approved:
-            execution.status = "running"
-            self.repo.save_tool_execution(execution)
-
-            tool = self.tools.get(execution.tool_name)
-            result = await tool.validate_and_execute(
-                execution.tool_call_id, execution.arguments, workspace
-            )
-            execution.apply_result(result)
-            self.repo.save_tool_execution(execution)
-
+        token = CURRENT_SESSION_ID.set(session.id)
+        try:
             await self.events.publish(
                 SystemEvent(
-                    event_type="TOOL_CALLED",
+                    event_type="APPROVAL_RESOLVED",
                     session_id=session.id,
                     run_id=run.id,
                     payload={
+                        "execution_id": str(execution.id),
                         "tool_name": execution.tool_name,
-                        "status": result.status,
-                        "execution_time_ms": result.execution_time_ms,
+                        "approved": approved,
                     },
                 )
             )
-            tool_output = result.output
-        else:
-            execution.status = "denied_by_user"
-            execution.output = "Acción rechazada por el usuario."
-            execution.updated_at = _utc_now()
-            self.repo.save_tool_execution(execution)
-            tool_output = (
-                f"Permiso denegado por el usuario: la ejecución de '{execution.tool_name}' "
-                "fue rechazada manualmente. No vuelvas a intentarla con los mismos parámetros."
+
+            if approved:
+                execution.status = "running"
+                self.repo.save_tool_execution(execution)
+
+                tool = self.tools.get(execution.tool_name)
+                result = await tool.validate_and_execute(
+                    execution.tool_call_id, execution.arguments, workspace
+                )
+                execution.apply_result(result)
+                self.repo.save_tool_execution(execution)
+
+                await self.events.publish(
+                    SystemEvent(
+                        event_type="TOOL_CALLED",
+                        session_id=session.id,
+                        run_id=run.id,
+                        payload={
+                            "tool_name": execution.tool_name,
+                            "status": result.status,
+                            "execution_time_ms": result.execution_time_ms,
+                        },
+                    )
+                )
+                tool_output = result.output
+            else:
+                execution.status = "denied_by_user"
+                execution.output = "Acción rechazada por el usuario."
+                execution.updated_at = _utc_now()
+                self.repo.save_tool_execution(execution)
+                tool_output = (
+                    f"Permiso denegado por el usuario: la ejecución de '{execution.tool_name}' "
+                    "fue rechazada manualmente. No vuelvas a intentarla con los mismos parámetros."
+                )
+
+            next_seq = self.repo.get_next_sequence(run.id)
+            self.repo.append_message(
+                Message(
+                    run_id=run.id,
+                    session_id=session.id,
+                    sequence=next_seq,
+                    role="tool",
+                    content=tool_output,
+                    tool_call_id=execution.tool_call_id,
+                    tool_name=execution.tool_name,
+                )
             )
 
-        next_seq = self.repo.get_next_sequence(run.id)
-        self.repo.append_message(
-            Message(
-                run_id=run.id,
-                session_id=session.id,
-                sequence=next_seq,
-                role="tool",
-                content=tool_output,
-                tool_call_id=execution.tool_call_id,
-                tool_name=execution.tool_name,
+            run.status = "running"
+            self.repo.update_run_state(run.id, status="running", current_step=run.current_step)
+            self.repo.update_session_status(session.id, status="running")
+
+            history = self.repo.list_messages(run.id)
+            pending_calls = self._find_unanswered_tool_calls(history)
+            if pending_calls:
+                paused = await self._process_tool_calls(
+                    session=session,
+                    run=run,
+                    config=config,
+                    tool_calls=pending_calls,
+                    workspace=workspace,
+                )
+                if paused:
+                    return run
+
+            self.repo.update_run_state(run.id, status="running", current_step=run.current_step)
+            await self.events.publish(
+                SystemEvent(
+                    event_type="STEP_COMPLETED",
+                    session_id=session.id,
+                    run_id=run.id,
+                    payload={"step": run.current_step},
+                )
             )
-        )
 
-        # Reactivar estado del run y sesión
-        run.status = "running"
-        self.repo.update_run_state(run.id, status="running", current_step=run.current_step)
-        self.repo.update_session_status(session.id, status="running")
-
-        # Verificar si quedaron más tool_calls sin responder en el último turno del asistente
-        history = self.repo.list_messages(run.id)
-        pending_calls = self._find_unanswered_tool_calls(history)
-        if pending_calls:
-            paused = await self._process_tool_calls(
-                session=session,
-                run=run,
-                config=config,
-                tool_calls=pending_calls,
-                workspace=workspace,
-            )
-            if paused:
-                return run
-
-        self.repo.update_run_state(run.id, status="running", current_step=run.current_step)
-        await self.events.publish(
-            SystemEvent(
-                event_type="STEP_COMPLETED",
-                session_id=session.id,
-                run_id=run.id,
-                payload={"step": run.current_step},
-            )
-        )
-
-        return await self._run_loop(session=session, run=run, config=config, workspace=workspace)
+            return await self._run_loop(session=session, run=run, config=config, workspace=workspace)
+        finally:
+            CURRENT_SESSION_ID.reset(token)
 
     def _find_unanswered_tool_calls(self, history: list[Message]) -> list[ToolCall]:
         last_assistant_idx = -1
@@ -394,10 +426,6 @@ class AgentEngine:
         tool_calls: list[ToolCall],
         workspace: Path,
     ) -> bool:
-        """
-        Ejecuta una secuencia de ToolCalls. Devuelve True si se pausó esperando
-        aprobación humana (HITL), o False si todas se completaron.
-        """
         for tc in tool_calls:
             if tc.tool_name not in config.allowed_tools:
                 result = ToolResult(
@@ -512,4 +540,3 @@ class AgentEngine:
             )
         )
         return run
-

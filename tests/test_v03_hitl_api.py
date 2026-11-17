@@ -5,15 +5,18 @@ from typing import Any
 from fastapi.testclient import TestClient
 
 from backend.agents.engine import AgentEngine
+from backend.agents.orchestrator import MultiAgentOrchestrator
 from backend.agents.registry import AgentRegistry
 from backend.agents.schemas import AgentConfig
 from backend.api.dependencies import AppContainer
 from backend.api.main import create_app
+from backend.api.ws import SessionConnectionManager
 from backend.core.events import EventBus
 from backend.providers.base import BaseProvider
 from backend.providers.schemas import LLMResponse, Message, TokenUsage, ToolCall, ToolDefinition
 from backend.storage.database import Database
 from backend.storage.repository import StorageRepository
+from backend.tools.blackboard import ReadBlackboardTool, WriteBlackboardTool
 from backend.tools.filesystem import EditFileTool, ListFilesTool, ReadFileTool, WriteFileTool
 from backend.tools.registry import ToolRegistry
 
@@ -49,15 +52,34 @@ def _build_test_client(tmp_path: Path, responses: list[LLMResponse]) -> tuple[Te
     db.initialize()
     repo = StorageRepository(db)
     events = EventBus()
+    ws_manager = SessionConnectionManager()
+    events.subscribe("*", ws_manager.broadcast_event)
 
     agents = AgentRegistry()
+    agents.register(
+        AgentConfig(
+            id="explorador",
+            name="Explorador",
+            role="Analista",
+            system_prompt="Eres un explorador.",
+            allowed_tools=("list_files", "read_file", "read_blackboard", "write_blackboard"),
+            max_steps=5,
+        )
+    )
     agents.register(
         AgentConfig(
             id="programador",
             name="Programador",
             role="Dev",
             system_prompt="Eres un programador.",
-            allowed_tools=("list_files", "read_file", "write_file", "edit_file"),
+            allowed_tools=(
+                "list_files",
+                "read_file",
+                "write_file",
+                "edit_file",
+                "read_blackboard",
+                "write_blackboard",
+            ),
             max_steps=5,
         )
     )
@@ -67,6 +89,8 @@ def _build_test_client(tmp_path: Path, responses: list[LLMResponse]) -> tuple[Te
     tools.register(ReadFileTool())
     tools.register(WriteFileTool())
     tools.register(EditFileTool())
+    tools.register(ReadBlackboardTool(repo))
+    tools.register(WriteBlackboardTool(repo))
 
     provider = ScriptedMockProvider(responses)
     engine = AgentEngine(
@@ -76,10 +100,18 @@ def _build_test_client(tmp_path: Path, responses: list[LLMResponse]) -> tuple[Te
         event_bus=events,
         provider_factory=lambda route: provider,
     )
+    orchestrator = MultiAgentOrchestrator(engine=engine, repository=repo, event_bus=events)
 
     app = create_app(db_path=tmp_path / "api_test.db")
     app.state.container = AppContainer(
-        db=db, repo=repo, events=events, agents=agents, tools=tools, engine=engine
+        db=db,
+        repo=repo,
+        events=events,
+        ws_manager=ws_manager,
+        agents=agents,
+        tools=tools,
+        engine=engine,
+        orchestrator=orchestrator,
     )
     return TestClient(app), ws
 
