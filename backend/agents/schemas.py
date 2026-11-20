@@ -1,3 +1,4 @@
+from backend.tools.git_ops import GitCheckpoint
 from datetime import datetime, timezone
 from typing import Any, Literal
 from uuid import UUID, uuid4
@@ -16,6 +17,7 @@ SessionStatus = Literal[
     "pending",
     "running",
     "awaiting_approval",
+    "interrupted",
     "completed",
     "failed",
     "cancelled",
@@ -25,6 +27,7 @@ RunStatus = Literal[
     "queued",
     "running",
     "awaiting_approval",
+    "interrupted",
     "completed",
     "failed",
     "cancelled",
@@ -59,7 +62,7 @@ class AgentConfig(BaseModel):
     )
     model_override: str | None = Field(
         default=None,
-        description="Forzar un modelo específico (ej. 'gemini-4-hydrogen')",
+        description="Forzar un modelo específico (ej. 'gemini-2.5-flash')",
     )
     temperature: float = Field(default=0.2, ge=0.0, le=2.0)
     allowed_tools: tuple[str, ...] = Field(
@@ -82,7 +85,10 @@ class TaskSession(BaseModel):
     status: SessionStatus = "pending"
     workspace_path: str = Field(min_length=1)
     blackboard: dict[str, Any] = Field(default_factory=dict)
+    pipeline_stages: list[dict[str, str]] = Field(default_factory=list)
+    current_stage_index: int = Field(default=0, ge=0)
     use_knowledge_graph: bool = False
+    git_checkpoint: GitCheckpoint = Field(default_factory=GitCheckpoint)
     max_budget_tokens: int = Field(default=100_000, gt=0)
     total_tokens_used: int = Field(default=0, ge=0)
     final_output: str | None = None

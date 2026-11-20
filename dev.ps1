@@ -12,7 +12,7 @@ if (-not (Test-Path $pythonExe)) {
 Write-Host "Iniciando AGENT LAB (Backend + Frontend)..." -ForegroundColor Cyan
 
 $backend = Start-Process -FilePath $pythonExe `
-    -ArgumentList "-m", "uvicorn", "backend.api.main:app", "--reload", "--port", "8000" `
+    -ArgumentList "-m", "uvicorn", "backend.api.main:app", "--reload", "--reload-dir", "backend", "--port", "8000" `
     -WorkingDirectory $root `
     -NoNewWindow -PassThru
 
@@ -32,3 +32,4 @@ try {
     if (-not $frontend.HasExited) { Stop-Process -Id $frontend.Id -Force -ErrorAction SilentlyContinue }
     Write-Host "`nServidores detenidos." -ForegroundColor Yellow
 }
+

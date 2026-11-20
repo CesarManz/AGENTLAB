@@ -1,4 +1,4 @@
-﻿from collections.abc import Sequence
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -6,6 +6,8 @@ from fastapi.testclient import TestClient
 
 from backend.agents.engine import AgentEngine
 from backend.agents.orchestrator import MultiAgentOrchestrator
+from backend.agents.planner import TaskPlanner
+from backend.core.skills import SkillRegistry
 from backend.agents.registry import AgentRegistry
 from backend.agents.schemas import AgentConfig
 from backend.api.dependencies import AppContainer
@@ -101,6 +103,8 @@ def _build_test_client(tmp_path: Path, responses: list[LLMResponse]) -> tuple[Te
         provider_factory=lambda route: provider,
     )
     orchestrator = MultiAgentOrchestrator(engine=engine, repository=repo, event_bus=events)
+    planner = TaskPlanner(agent_registry=agents, repository=repo, provider_factory=lambda route: provider)
+    skills = SkillRegistry()
 
     app = create_app(db_path=tmp_path / "api_test.db")
     app.state.container = AppContainer(
@@ -112,6 +116,8 @@ def _build_test_client(tmp_path: Path, responses: list[LLMResponse]) -> tuple[Te
         tools=tools,
         engine=engine,
         orchestrator=orchestrator,
+        planner=planner,
+        skills=skills,
     )
     return TestClient(app), ws
 

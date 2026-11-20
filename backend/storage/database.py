@@ -36,7 +36,10 @@ class Database:
             status TEXT NOT NULL,
             workspace_path TEXT NOT NULL,
             blackboard_json TEXT NOT NULL DEFAULT '{}',
+            pipeline_stages_json TEXT NOT NULL DEFAULT '[]',
+            current_stage_index INTEGER NOT NULL DEFAULT 0,
             use_knowledge_graph INTEGER NOT NULL DEFAULT 0,
+            git_checkpoint_json TEXT NOT NULL DEFAULT '{}',
             max_budget_tokens INTEGER NOT NULL,
             total_tokens_used INTEGER NOT NULL DEFAULT 0,
             final_output TEXT,
@@ -95,6 +98,8 @@ class Database:
             output TEXT,
             execution_time_ms INTEGER,
             artifacts_created_json TEXT NOT NULL DEFAULT '[]',
+            diff_preview TEXT,
+            target_file_sha256 TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY (run_id) REFERENCES agent_runs(id) ON DELETE CASCADE,
@@ -134,3 +139,15 @@ class Database:
 
         with self.connect() as conn:
             conn.executescript(schema_sql)
+            cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_sessions)").fetchall()}
+            if "pipeline_stages_json" not in cols:
+                conn.execute("ALTER TABLE task_sessions ADD COLUMN pipeline_stages_json TEXT NOT NULL DEFAULT '[]'")
+            if "current_stage_index" not in cols:
+                conn.execute("ALTER TABLE task_sessions ADD COLUMN current_stage_index INTEGER NOT NULL DEFAULT 0")
+            if "git_checkpoint_json" not in cols:
+                conn.execute("ALTER TABLE task_sessions ADD COLUMN git_checkpoint_json TEXT NOT NULL DEFAULT '{}'")
+            te_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tool_executions)").fetchall()}
+            if "diff_preview" not in te_cols:
+                conn.execute("ALTER TABLE tool_executions ADD COLUMN diff_preview TEXT")
+            if "target_file_sha256" not in te_cols:
+                conn.execute("ALTER TABLE tool_executions ADD COLUMN target_file_sha256 TEXT")

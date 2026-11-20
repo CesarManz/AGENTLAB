@@ -1,4 +1,5 @@
-﻿from typing import Any
+from backend.tools.git_ops import GitCheckpoint
+from typing import Any
 import json
 from datetime import datetime, timezone
 from uuid import UUID
@@ -31,9 +32,10 @@ class StorageRepository:
         sql = """
         INSERT INTO task_sessions (
             id, user_prompt, status, workspace_path, blackboard_json,
-            use_knowledge_graph, max_budget_tokens, total_tokens_used,
+            pipeline_stages_json, current_stage_index,
+            use_knowledge_graph, git_checkpoint_json, max_budget_tokens, total_tokens_used,
             final_output, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         with self.db.connect() as conn:
             conn.execute(
@@ -44,7 +46,10 @@ class StorageRepository:
                     session.status,
                     session.workspace_path,
                     json.dumps(session.blackboard),
+                    json.dumps(session.pipeline_stages),
+                    session.current_stage_index,
                     1 if session.use_knowledge_graph else 0,
+                    session.git_checkpoint.model_dump_json(),
                     session.max_budget_tokens,
                     session.total_tokens_used,
                     session.final_output,
@@ -68,7 +73,10 @@ class StorageRepository:
             status=row["status"],
             workspace_path=row["workspace_path"],
             blackboard=json.loads(row["blackboard_json"]),
+            pipeline_stages=json.loads((row["pipeline_stages_json"] if "pipeline_stages_json" in row.keys() else "[]")),
+            current_stage_index=int((row["current_stage_index"] if "current_stage_index" in row.keys() else 0)),
             use_knowledge_graph=bool(row["use_knowledge_graph"]),
+            git_checkpoint=GitCheckpoint.model_validate_json(row["git_checkpoint_json"] if "git_checkpoint_json" in row.keys() and row["git_checkpoint_json"] else "{}"),
             max_budget_tokens=row["max_budget_tokens"],
             total_tokens_used=row["total_tokens_used"],
             final_output=row["final_output"],
@@ -88,7 +96,10 @@ class StorageRepository:
                 status=row["status"],
                 workspace_path=row["workspace_path"],
                 blackboard=json.loads(row["blackboard_json"]),
+                pipeline_stages=json.loads((row["pipeline_stages_json"] if "pipeline_stages_json" in row.keys() else "[]")),
+                current_stage_index=int((row["current_stage_index"] if "current_stage_index" in row.keys() else 0)),
                 use_knowledge_graph=bool(row["use_knowledge_graph"]),
+            git_checkpoint=GitCheckpoint.model_validate_json(row["git_checkpoint_json"] if "git_checkpoint_json" in row.keys() and row["git_checkpoint_json"] else "{}"),
                 max_budget_tokens=row["max_budget_tokens"],
                 total_tokens_used=row["total_tokens_used"],
                 final_output=row["final_output"],
@@ -113,6 +124,65 @@ class StorageRepository:
             conn.execute(
                 sql,
                 (status, final_output, _utc_iso(), str(session_id)),
+            )
+
+    def delete_session(self, session_id: UUID) -> bool:
+        sid = str(session_id)
+        with self.db.connect() as conn:
+            conn.execute("DELETE FROM token_ledger WHERE session_id = ?", (sid,))
+            conn.execute("DELETE FROM tool_executions WHERE session_id = ?", (sid,))
+            conn.execute("DELETE FROM agent_runs WHERE session_id = ?", (sid,))
+            cur = conn.execute("DELETE FROM task_sessions WHERE id = ?", (sid,))
+            return cur.rowcount > 0
+
+    def clear_sessions(self) -> int:
+        with self.db.connect() as conn:
+            conn.execute("DELETE FROM token_ledger WHERE session_id IN (SELECT id FROM task_sessions WHERE status != 'running')")
+            conn.execute("DELETE FROM tool_executions WHERE session_id IN (SELECT id FROM task_sessions WHERE status != 'running')")
+            conn.execute("DELETE FROM agent_runs WHERE session_id IN (SELECT id FROM task_sessions WHERE status != 'running')")
+            cur = conn.execute("DELETE FROM task_sessions WHERE status != 'running'")
+            return cur.rowcount
+
+    def recover_interrupted_sessions(self) -> list[UUID]:
+        """
+        Reconcilia sesiones y ejecuciones que quedaron en estado 'running' tras un cierre
+        abrupto o reinicio del servidor, marcándolas como 'interrupted' para reanudación segura.
+        Las sesiones en 'awaiting_approval' permanecen intactas.
+        """
+        now = _utc_iso()
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM task_sessions WHERE status = 'running'"
+            ).fetchall()
+            session_ids = [UUID(row["id"]) for row in rows]
+            if session_ids:
+                conn.execute(
+                    """
+                    UPDATE task_sessions
+                    SET status = 'interrupted',
+                        final_output = COALESCE(final_output, 'Ejecución interrumpida por reinicio del servidor.'),
+                        updated_at = ?
+                    WHERE status = 'running'
+                    """,
+                    (now,),
+                )
+            conn.execute(
+                """
+                UPDATE agent_runs
+                SET status = 'interrupted',
+                    error_message = COALESCE(error_message, 'Ejecución interrumpida por reinicio del servidor.'),
+                    completed_at = ?
+                WHERE status = 'running'
+                """,
+                (now,),
+            )
+        return session_ids
+
+    def update_git_checkpoint(self, session_id: UUID, checkpoint: GitCheckpoint) -> None:
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE task_sessions SET git_checkpoint_json = ?, updated_at = ? WHERE id = ?",
+                (checkpoint.model_dump_json(), _utc_iso(), str(session_id)),
             )
 
     def update_blackboard(self, session_id: UUID, key: str, value: Any) -> dict[str, Any]:
@@ -345,6 +415,8 @@ class StorageRepository:
             output=r["output"],
             execution_time_ms=r["execution_time_ms"],
             artifacts_created=json.loads(r["artifacts_created_json"]),
+            diff_preview=r["diff_preview"] if "diff_preview" in r.keys() else None,
+            target_file_sha256=r["target_file_sha256"] if "target_file_sha256" in r.keys() else None,
             created_at=datetime.fromisoformat(r["created_at"]),
             updated_at=datetime.fromisoformat(r["updated_at"]),
         )
@@ -354,8 +426,8 @@ class StorageRepository:
         INSERT INTO tool_executions (
             id, tool_call_id, run_id, session_id, tool_name,
             arguments_json, risk_level, status, output,
-            execution_time_ms, artifacts_created_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            execution_time_ms, artifacts_created_json, diff_preview, target_file_sha256, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             status = excluded.status,
             output = excluded.output,
@@ -378,6 +450,8 @@ class StorageRepository:
                     execution.output,
                     execution.execution_time_ms,
                     json.dumps(execution.artifacts_created),
+                    execution.diff_preview,
+                    execution.target_file_sha256,
                     execution.created_at.isoformat(),
                     execution.updated_at.isoformat(),
                 ),
@@ -460,3 +534,33 @@ class StorageRepository:
 
 
 
+
+    def get_session_cost_usd(self, session_id: UUID) -> float:
+        sql = "SELECT COALESCE(SUM(estimated_cost_usd), 0.0) AS total_cost FROM token_ledger WHERE session_id = ?"
+        with self.db.connect() as conn:
+            row = conn.execute(sql, (str(session_id),)).fetchone()
+        return round(float(row["total_cost"]), 6) if row else 0.0
+
+    def get_total_cost_usd(self) -> float:
+        sql = "SELECT COALESCE(SUM(estimated_cost_usd), 0.0) AS total_cost FROM token_ledger"
+        with self.db.connect() as conn:
+            row = conn.execute(sql).fetchone()
+        return round(float(row["total_cost"]), 6) if row else 0.0
+
+    def update_session_pipeline(
+        self,
+        session_id: UUID,
+        *,
+        pipeline_stages: list[dict[str, str]],
+        current_stage_index: int,
+    ) -> None:
+        sql = """
+        UPDATE task_sessions
+        SET pipeline_stages_json = ?, current_stage_index = ?, updated_at = ?
+        WHERE id = ?
+        """
+        with self.db.connect() as conn:
+            conn.execute(
+                sql,
+                (json.dumps(pipeline_stages), current_stage_index, _utc_iso(), str(session_id)),
+            )

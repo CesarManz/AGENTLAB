@@ -1,4 +1,5 @@
-﻿from collections.abc import Callable
+from backend.tools.git_ops import GitSafetyManager, build_hitl_file_preview, compute_file_sha256
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID
@@ -6,6 +7,8 @@ from uuid import UUID
 from backend.agents.registry import AgentRegistry
 from backend.agents.schemas import AgentConfig, AgentRun, TaskSession
 from backend.core.config import ModelRoute, resolve_model_route
+from backend.core.pricing import estimate_call_cost_usd
+from backend.core.skills import SkillRegistry
 from backend.core.events import EventBus, SystemEvent
 from backend.providers.base import BaseProvider
 from backend.providers.schemas import Message, ToolCall
@@ -36,15 +39,38 @@ class AgentEngine:
         repository: StorageRepository,
         event_bus: EventBus,
         provider_factory: ProviderFactory,
+        skill_registry: SkillRegistry | None = None,
     ) -> None:
         self.agents = agent_registry
         self.tools = tool_registry
         self.repo = repository
         self.events = event_bus
         self.provider_factory = provider_factory
+        self.skills = skill_registry or SkillRegistry()
 
     def _requires_approval(self, risk_level: str) -> bool:
         return risk_level != "safe"
+
+    def _track_git_file_mutation(
+        self,
+        session: TaskSession,
+        tool_name: str,
+        arguments: dict[str, Any],
+        existed_before: bool,
+        result_status: str,
+    ) -> None:
+        if result_status != "success" or tool_name not in ("write_file", "edit_file"):
+            return
+        rel_path = str(arguments.get("path", "")).strip()
+        if not rel_path:
+            return
+        fresh = self.repo.get_session(session.id) or session
+        if not fresh.git_checkpoint.is_git_repo:
+            return
+        mgr = GitSafetyManager(fresh.workspace_path)
+        updated_cp = mgr.record_agent_file_change(fresh.git_checkpoint, rel_path, existed_before)
+        session.git_checkpoint = updated_cp
+        self.repo.update_git_checkpoint(session.id, updated_cp)
 
     async def execute_session(self, session: TaskSession, agent_id: str) -> AgentRun:
         """
@@ -94,7 +120,7 @@ class AgentEngine:
             dag_node_id=dag_node_id,
             agent_id=config.id,
             task_instruction=task_instruction,
-            active_skills=list(config.default_skills),
+            active_skills=[s.id for s in self.skills.resolve_for_task(task_instruction=task_instruction, default_skills=config.default_skills)],
             status="running",
             started_at=_utc_now(),
         )
@@ -167,10 +193,30 @@ class AgentEngine:
                 self.repo.save_tool_execution(execution)
 
                 tool = self.tools.get(execution.tool_name)
-                result = await tool.validate_and_execute(
-                    execution.tool_call_id, execution.arguments, workspace
-                )
+                target_rel = str(execution.arguments.get("path", "")).strip()
+                existed_before = (workspace / target_rel).exists() if target_rel else False
+                integrity_conflict = False
+                if execution.target_file_sha256 and target_rel:
+                    current_sha = compute_file_sha256(workspace / target_rel)
+                    if current_sha != execution.target_file_sha256:
+                        integrity_conflict = True
+                if integrity_conflict:
+                    result = ToolResult(
+                        tool_call_id=execution.tool_call_id,
+                        tool_name=execution.tool_name,
+                        status="error",
+                        output=(
+                            f"Conflicto de integridad: el archivo '{target_rel}' cambió en disco "
+                            "desde que se generó el diff de aprobación. Se canceló la escritura para no pisar cambios."
+                        ),
+                        execution_time_ms=0,
+                    )
+                else:
+                    result = await tool.validate_and_execute(
+                        execution.tool_call_id, execution.arguments, workspace
+                    )
                 execution.apply_result(result)
+                self._track_git_file_mutation(session, execution.tool_name, execution.arguments, existed_before, result.status)
                 self.repo.save_tool_execution(execution)
 
                 await self.events.publish(
@@ -291,11 +337,18 @@ class AgentEngine:
 
                 response = await provider.generate(
                     history,
-                    system_instruction=config.system_prompt,
+                    system_instruction=config.system_prompt + self.skills.render_prompt_block([s for sid in run.active_skills if (s := self.skills.get(sid)) is not None]),
                     tools=tool_definitions if tool_definitions else None,
                     temperature=config.temperature,
                 )
 
+                call_cost = estimate_call_cost_usd(
+                    provider=response.provider,
+                    model_name=response.model_name,
+                    input_tokens=response.usage.input_tokens,
+                    output_tokens=response.usage.output_tokens,
+                    cached_tokens=response.usage.cached_tokens,
+                )
                 ledger_entry = TokenLedgerEntry(
                     session_id=session.id,
                     run_id=run.id,
@@ -307,6 +360,7 @@ class AgentEngine:
                     output_tokens=response.usage.output_tokens,
                     cached_tokens=response.usage.cached_tokens,
                     total_tokens=response.usage.total_tokens,
+                    estimated_cost_usd=call_cost,
                     latency_ms=response.latency_ms,
                     used_knowledge_graph=session.use_knowledge_graph,
                 )
@@ -450,6 +504,12 @@ class AgentEngine:
                 continue
 
             tool = self.tools.get(tc.tool_name)
+            needs_approval = self._requires_approval(tool.risk_level)
+            diff_preview, target_sha = (
+                build_hitl_file_preview(workspace, tc.tool_name, tc.arguments)
+                if needs_approval
+                else (None, None)
+            )
             execution = ToolExecution(
                 tool_call_id=tc.id,
                 run_id=run.id,
@@ -457,7 +517,9 @@ class AgentEngine:
                 tool_name=tc.tool_name,
                 arguments=tc.arguments,
                 risk_level=tool.risk_level,
-                status="awaiting_approval" if self._requires_approval(tool.risk_level) else "running",
+                status="awaiting_approval" if needs_approval else "running",
+                diff_preview=diff_preview,
+                target_file_sha256=target_sha,
             )
             self.repo.save_tool_execution(execution)
 
@@ -479,13 +541,17 @@ class AgentEngine:
                             "tool_name": execution.tool_name,
                             "risk_level": execution.risk_level,
                             "arguments": execution.arguments,
+                            "diff_preview": execution.diff_preview,
                         },
                     )
                 )
                 return True
 
+            target_rel = str(tc.arguments.get("path", "")).strip()
+            existed_before = (workspace / target_rel).exists() if target_rel else False
             result = await tool.validate_and_execute(tc.id, tc.arguments, workspace)
             execution.apply_result(result)
+            self._track_git_file_mutation(session, tc.tool_name, tc.arguments, existed_before, result.status)
             self.repo.save_tool_execution(execution)
 
             await self.events.publish(
@@ -540,3 +606,4 @@ class AgentEngine:
             )
         )
         return run
+

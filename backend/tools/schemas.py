@@ -59,6 +59,8 @@ class ToolExecution(BaseModel):
     output: str | None = None
     execution_time_ms: int | None = Field(default=None, ge=0)
     artifacts_created: list[str] = Field(default_factory=list)
+    diff_preview: str | None = None
+    target_file_sha256: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
