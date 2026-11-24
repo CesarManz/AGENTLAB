@@ -1,20 +1,23 @@
 import { useState } from "react";
 import {
-  Activity,
-  ArrowRight,
-  Bot,
   Check,
-  CheckCircle2,
-  FileText,
+  ChevronDown,
   GitBranch,
-  Layers,
   Play,
   RotateCcw,
   ShieldAlert,
-  Terminal,
+  Square,
   X,
 } from "lucide-react";
-import type { SessionStateResponse, SystemEventDTO } from "../api";
+import type { SessionStateResponse, SystemEventDTO, ToolExecutionDTO } from "../api";
+import {
+  TONE_CLASSES,
+  TONE_DOT,
+  TOOL_LABELS,
+  agentLabel,
+  describeEvent,
+  statusInfo,
+} from "../labels";
 import { DiffViewer } from "./DiffViewer";
 
 interface LiveMissionMonitorProps {
@@ -28,30 +31,64 @@ interface LiveMissionMonitorProps {
   onResume: () => void;
   onNewMission: () => void;
   onRetryMission: () => void;
+  onStopMission: () => void;
 }
 
-const STATUS_LABELS: Record<string, { label: string; style: string }> = {
-  completed: {
-    label: "Completada",
-    style: "text-emerald-300 bg-emerald-500/10 border-emerald-500/30",
-  },
-  awaiting_approval: {
-    label: "Esperando Tu Aprobación",
-    style: "text-amber-300 bg-amber-500/15 border-amber-500/40",
-  },
-  interrupted: {
-    label: "Interrumpida (Reanudable)",
-    style: "text-amber-300 bg-amber-500/15 border-amber-500/40",
-  },
-  running: {
-    label: "Ejecutando",
-    style: "text-cyan-300 bg-cyan-500/10 border-cyan-500/30",
-  },
-  failed: {
-    label: "Con Error",
-    style: "text-rose-300 bg-rose-500/10 border-rose-500/30",
-  },
-};
+function explainApproval(item: ToolExecutionDTO) {
+  const path = typeof item.arguments?.path === "string" ? item.arguments.path : null;
+  switch (item.tool_name) {
+    case "write_file":
+      return {
+        title: path ? `Quiere crear o reemplazar el archivo “${path}”` : "Quiere crear un archivo",
+        detail: "Abajo ves exactamente lo que va a escribir. Si existía, se guarda una copia de respaldo.",
+      };
+    case "edit_file":
+      return {
+        title: path ? `Quiere editar el archivo “${path}”` : "Quiere editar un archivo",
+        detail: "Las líneas verdes se agregan y las rojas se quitan.",
+      };
+    case "run_pytest":
+      return {
+        title: "Quiere ejecutar las pruebas automáticas",
+        detail: "Corre los tests del proyecto para comprobar que todo funcione. No usa tus claves privadas.",
+      };
+    default:
+      return {
+        title: `Quiere ${TOOL_LABELS[item.tool_name] ?? item.tool_name}`,
+        detail: "Revisá los detalles antes de decidir.",
+      };
+  }
+}
+
+function Section({
+  title,
+  count,
+  defaultOpen = false,
+  children,
+}: {
+  title: string;
+  count?: number;
+  defaultOpen?: boolean;
+  children: React.ReactNode;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div className="card overflow-hidden">
+      <button
+        type="button"
+        onClick={() => setOpen(!open)}
+        className="w-full flex items-center justify-between px-5 py-4 cursor-pointer"
+      >
+        <span className="text-sm font-semibold text-ink-900">
+          {title}
+          {count !== undefined && <span className="ml-2 text-xs font-normal text-ink-500">({count})</span>}
+        </span>
+        <ChevronDown className={`w-4 h-4 text-ink-500 transition-transform ${open ? "rotate-180" : ""}`} />
+      </button>
+      {open && <div className="px-5 pb-5">{children}</div>}
+    </div>
+  );
+}
 
 export function LiveMissionMonitor({
   sessionState,
@@ -64,27 +101,20 @@ export function LiveMissionMonitor({
   onResume,
   onNewMission,
   onRetryMission,
+  onStopMission,
 }: LiveMissionMonitorProps) {
-  const [inspectorTab, setInspectorTab] = useState<"logs" | "memory">("logs");
-
   if (!sessionState) {
     return (
-      <div className="flex-1 flex items-center justify-center p-8">
-        <div className="max-w-md text-center bg-[#0c0d10] border border-[#1f222a] rounded-xl p-8 space-y-4">
-          <div className="w-12 h-12 rounded-full bg-indigo-500/10 border border-indigo-500/30 flex items-center justify-center mx-auto text-indigo-400">
-            <Bot className="w-6 h-6" />
-          </div>
-          <h2 className="text-base font-semibold text-white">No hay una misión activa seleccionada</h2>
-          <p className="text-xs text-zinc-400 leading-relaxed">
-            Lanza una nueva misión o selecciona una ejecución anterior desde el historial para ver su progreso y resultados.
+      <div className="flex-1 flex items-center justify-center p-8 min-h-[70vh]">
+        <div className="max-w-sm text-center space-y-4">
+          <div className="text-5xl">🌱</div>
+          <h2 className="font-serif text-2xl text-ink-900">Todavía no hay ninguna tarea</h2>
+          <p className="text-sm text-ink-500 leading-relaxed">
+            Cuando crees una tarea, acá vas a ver paso a paso lo que hacen los agentes.
           </p>
-          <button
-            type="button"
-            onClick={onNewMission}
-            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white cursor-pointer"
-          >
-            <Play className="w-3.5 h-3.5" />
-            Crear Nueva Misión
+          <button type="button" onClick={onNewMission} className="btn-primary">
+            <Play className="w-4 h-4" />
+            Crear mi primera tarea
           </button>
         </div>
       </div>
@@ -93,297 +123,255 @@ export function LiveMissionMonitor({
 
   const { session, runs, pending_approvals } = sessionState;
   const gateItem = pending_approvals[0] ?? null;
-  const statusInfo = STATUS_LABELS[session.status] ?? {
-    label: session.status,
-    style: "text-zinc-300 bg-zinc-800/60 border-zinc-700",
-  };
+  const status = statusInfo(session.status);
   const blackboardEntries = Object.entries(session.blackboard ?? {});
   const touchedCount = session.git_checkpoint?.agent_touched_paths?.length ?? 0;
+  const visibleEvents = events.filter((e) => e.event_type !== "PONG");
+  const isActive = session.status === "running" || session.status === "awaiting_approval";
+  const usedPct = Math.min(
+    100,
+    Math.round(((session.total_tokens_used || 0) / (session.max_budget_tokens || 1)) * 100)
+  );
 
   return (
-    <div className="p-6 max-w-7xl w-full mx-auto space-y-6">
-      {/* Cabecera de la Misión + Controles de Seguridad */}
-      <div className="bg-[#0c0d10] border border-[#1f222a] rounded-xl p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
-        <div className="space-y-1.5 min-w-0">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className={`font-mono text-[11px] px-2.5 py-0.5 rounded-full border ${statusInfo.style}`}>
-              {statusInfo.label}
+    <div className="max-w-4xl mx-auto px-6 py-10 space-y-6">
+      {/* Estado general */}
+      <div className="card p-6 space-y-4">
+        <div className="flex flex-wrap items-center gap-2">
+          <span
+            className={`inline-flex items-center gap-2 text-xs font-medium px-3 py-1 rounded-full border ${TONE_CLASSES[status.tone]}`}
+          >
+            <span
+              className={`w-2 h-2 rounded-full ${TONE_DOT[status.tone]} ${
+                session.status === "running" ? "animate-soft-pulse" : ""
+              }`}
+            />
+            {status.label}
+          </span>
+          {session.git_checkpoint?.is_git_repo && session.git_checkpoint.mission_branch && (
+            <span
+              className="inline-flex items-center gap-1 text-[11px] font-mono px-2.5 py-1 rounded-full bg-cream-100 border border-cream-200 text-ink-500"
+              title="Los cambios se guardan en una rama separada para no afectar tu trabajo"
+            >
+              <GitBranch className="w-3 h-3" />
+              {session.git_checkpoint.mission_branch}
             </span>
-            {session.git_checkpoint?.is_git_repo && session.git_checkpoint.mission_branch && (
-              <span className="font-mono text-[11px] px-2.5 py-0.5 rounded-full bg-indigo-500/10 border border-indigo-500/30 text-indigo-300 flex items-center gap-1">
-                <GitBranch className="w-3 h-3" />
-                {session.git_checkpoint.mission_branch}
-              </span>
-            )}
-            <span className="font-mono text-[11px] text-zinc-500">
-              ID #{session.id.slice(0, 8)}
-            </span>
-          </div>
-          <h1 className="text-base font-semibold text-white truncate" title={session.user_prompt}>
-            {session.user_prompt}
-          </h1>
+          )}
         </div>
 
-        <div className="flex flex-wrap items-center gap-2.5 shrink-0">
-          {session.status === "failed" && (
-            <button
-              type="button"
-              onClick={onRetryMission}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium cursor-pointer"
-            >
-              <RotateCcw className="w-3.5 h-3.5" />
-              Reintentar Misión
-            </button>
-          )}
-          {session.status === "interrupted" && (
-            <button
-              type="button"
-              disabled={isSafetyBusy}
-              onClick={onResume}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-200 text-xs font-medium cursor-pointer"
-            >
-              <Play className="w-3.5 h-3.5" />
-              Reanudar Sesión
-            </button>
-          )}
-          {session.git_checkpoint?.is_git_repo && touchedCount > 0 && (
-            <button
-              type="button"
-              disabled={isSafetyBusy}
-              onClick={onRollback}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-rose-500/15 hover:bg-rose-500/25 border border-rose-500/35 text-rose-300 text-xs font-medium cursor-pointer"
-            >
-              <RotateCcw className="w-3.5 h-3.5" />
-              Revertir Cambios ({touchedCount})
-            </button>
-          )}
+        <h1 className="font-serif text-2xl text-ink-900 leading-snug">{session.user_prompt}</h1>
+        <p className="text-sm text-ink-500">{status.hint}</p>
+
+        <div className="space-y-1.5">
+          <div className="flex justify-between text-[11px] text-ink-500">
+            <span>Consumo del límite</span>
+            <span className="font-mono">
+              {(session.total_tokens_used || 0).toLocaleString()} / {session.max_budget_tokens.toLocaleString()}
+            </span>
+          </div>
+          <div className="h-1.5 rounded-full bg-cream-200 overflow-hidden">
+            <div
+              className={`h-full rounded-full transition-all ${usedPct > 85 ? "bg-clay-500" : "bg-sage-500"}`}
+              style={{ width: `${usedPct}%` }}
+            />
+          </div>
         </div>
+
+        {(session.status === "failed" ||
+          session.status === "interrupted" ||
+          isActive ||
+          (session.git_checkpoint?.is_git_repo && touchedCount > 0)) && (
+          <div className="flex flex-wrap gap-2 pt-1">
+            {isActive && (
+              <button
+                type="button"
+                disabled={isSafetyBusy}
+                onClick={onStopMission}
+                className="btn-ghost"
+                title="Detiene a los agentes. Podrás continuar más tarde."
+              >
+                <Square className="w-3.5 h-3.5" />
+                Detener tarea
+              </button>
+            )}
+            {session.status === "failed" && (
+              <button type="button" onClick={onRetryMission} className="btn-primary">
+                <RotateCcw className="w-4 h-4" />
+                Intentar de nuevo
+              </button>
+            )}
+            {session.status === "interrupted" && (
+              <button type="button" disabled={isSafetyBusy} onClick={onResume} className="btn-primary">
+                <Play className="w-4 h-4" />
+                Continuar donde quedó
+              </button>
+            )}
+            {session.git_checkpoint?.is_git_repo && touchedCount > 0 && (
+              <button
+                type="button"
+                disabled={isSafetyBusy}
+                onClick={onRollback}
+                className="btn-ghost"
+                title="Devuelve los archivos a como estaban antes de esta tarea"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                Deshacer cambios ({touchedCount} {touchedCount === 1 ? "archivo" : "archivos"})
+              </button>
+            )}
+          </div>
+        )}
       </div>
 
       {safetyBanner && (
         <div
-          className={`px-4 py-3 rounded-lg border text-xs ${
-            safetyBanner.kind === "ok"
-              ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-300"
-              : "bg-amber-500/15 border-amber-500/35 text-amber-200"
+          className={`px-5 py-3.5 rounded-2xl border text-sm ${
+            safetyBanner.kind === "ok" ? TONE_CLASSES.sage : TONE_CLASSES.clay
           }`}
         >
           {safetyBanner.text}
         </div>
       )}
 
-      {/* BANNER PRIORITARIO HITL (solo aparece cuando requiere atención del usuario) */}
-      {gateItem && (
-        <div className="rounded-xl border-2 border-amber-500/60 bg-[#100e09] p-5 space-y-4 shadow-lg shadow-amber-950/20">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="flex items-center gap-2.5">
-              <div className="w-8 h-8 rounded-lg bg-amber-500/20 flex items-center justify-center text-amber-400">
+      {/* Permiso pendiente */}
+      {gateItem && (() => {
+        const info = explainApproval(gateItem);
+        return (
+          <div className="rounded-[1.25rem] border-2 border-clay-500/50 bg-clay-50 p-6 space-y-4">
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 shrink-0 rounded-full bg-white border border-clay-100 flex items-center justify-center text-clay-500">
                 <ShieldAlert className="w-5 h-5" />
               </div>
               <div>
-                <h2 className="text-sm font-semibold text-amber-300">
-                  Acción Pendiente de Aprobación Humana
-                </h2>
-                <p className="text-xs text-zinc-400">
-                  El agente solicita ejecutar{" "}
-                  <code className="text-amber-200 font-mono">{gateItem.tool_name}</code> (riesgo{" "}
-                  {gateItem.risk_level}). Revisa los cambios antes de continuar:
-                </p>
+                <div className="text-xs font-semibold uppercase tracking-wide text-clay-700">Necesitamos tu permiso</div>
+                <h2 className="text-base font-semibold text-ink-900 mt-0.5">{info.title}</h2>
+                <p className="text-sm text-ink-500 mt-1">{info.detail}</p>
               </div>
             </div>
 
-            <div className="flex items-center gap-2.5">
+            {gateItem.diff_preview ? (
+              <DiffViewer diffText={gateItem.diff_preview} />
+            ) : (
+              <pre className="rounded-2xl border border-cream-200 bg-white p-3 font-mono text-xs text-ink-700 overflow-x-auto max-h-48">
+                {JSON.stringify(gateItem.arguments, null, 2)}
+              </pre>
+            )}
+
+            <div className="flex flex-col-reverse sm:flex-row sm:justify-end gap-2">
               <button
                 type="button"
                 disabled={isResolving}
                 onClick={() => onDecision(gateItem.id, false)}
-                className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-[#16181f] hover:bg-rose-950/60 border border-[#2a2e39] text-rose-300 text-xs font-medium cursor-pointer"
+                className="btn-ghost"
               >
                 <X className="w-4 h-4" />
-                Rechazar
+                No, rechazar
               </button>
               <button
                 type="button"
                 disabled={isResolving}
                 onClick={() => onDecision(gateItem.id, true)}
-                className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold cursor-pointer"
+                className="btn-primary"
               >
                 <Check className="w-4 h-4" />
-                Aprobar y Ejecutar
+                {isResolving ? "Aplicando…" : "Sí, permitir"}
               </button>
             </div>
           </div>
+        );
+      })()}
 
-          {gateItem.diff_preview ? (
-            <DiffViewer diffText={gateItem.diff_preview} />
-          ) : (
-            <pre className="bg-[#050507] border border-[#1f222a] rounded-lg p-3 font-mono text-[11px] text-cyan-300 overflow-x-auto max-h-48">
-              {JSON.stringify(gateItem.arguments, null, 2)}
-            </pre>
-          )}
-        </div>
-      )}
-
-      {/* Cuerpo Principal: Izquierda (Etapas + Resultado) | Derecha (Logs / Memoria) */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        <div className="lg:col-span-7 space-y-6">
-          {/* Flujo de Agentes */}
-          <div className="bg-[#0c0d10] border border-[#1f222a] rounded-xl p-5 space-y-4">
-            <div className="flex items-center justify-between">
-              <h2 className="text-xs font-semibold uppercase tracking-wider text-zinc-400">
-                Progreso del Equipo de Agentes
-              </h2>
-              <span className="font-mono text-[11px] text-zinc-500">
-                {runs.length} {runs.length === 1 ? "etapa" : "etapas"}
-              </span>
-            </div>
-
-            {runs.length === 0 ? (
-              <div className="py-8 text-center text-xs text-zinc-500">
-                Preparando etapas de ejecución...
-              </div>
-            ) : (
-              <div className="space-y-3">
-                {runs.map((run, idx) => {
-                  const rStatus = STATUS_LABELS[run.status] ?? {
-                    label: run.status,
-                    style: "text-zinc-400 bg-zinc-800 border-zinc-700",
-                  };
-                  return (
-                    <div
-                      key={run.id}
-                      className="rounded-lg bg-[#08090c] border border-[#1c1f27] p-4 flex items-start justify-between gap-4"
-                    >
-                      <div className="space-y-1 min-w-0">
-                        <div className="flex items-center gap-2">
-                          <span className="font-mono text-[11px] text-indigo-400">
-                            Paso {idx + 1}
-                          </span>
-                          <ArrowRight className="w-3 h-3 text-zinc-600" />
-                          <span className="text-sm font-semibold text-white capitalize">
-                            {run.agent_id}
-                          </span>
-                        </div>
-                        <p className="text-xs text-zinc-400 line-clamp-2">
-                          {run.result_summary || run.task_instruction}
-                        </p>
-                        {run.error_message && (
-                          <div className="mt-2 rounded bg-rose-500/10 border border-rose-500/25 px-2.5 py-1.5 font-mono text-[11px] text-rose-300 break-words">
-                            {run.error_message}
-                          </div>
-                        )}
-                      </div>
-                      <div className="text-right shrink-0 space-y-1">
-                        <span className={`inline-block font-mono text-[10px] px-2 py-0.5 rounded border ${rStatus.style}`}>
-                          {rStatus.label}
-                        </span>
-                        <div className="font-mono text-[10px] text-zinc-500">
-                          Turno {run.current_step}
-                        </div>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
+      {/* Progreso del equipo */}
+      <div className="card p-6 space-y-5">
+        <h2 className="text-sm font-semibold text-ink-900">Progreso del equipo</h2>
+        {runs.length === 0 ? (
+          <div className="flex items-center gap-3 text-sm text-ink-500 py-4">
+            <span className="w-4 h-4 rounded-full border-2 border-sage-500 border-t-transparent animate-spin-slow" />
+            Organizando el trabajo…
           </div>
-
-          {/* Resultado Final */}
-          <div className="bg-[#0c0d10] border border-[#1f222a] rounded-xl p-5 space-y-3">
-            <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-zinc-400">
-              <FileText className="w-4 h-4 text-indigo-400" />
-              Resultado Final de la Misión
-            </div>
-            {session.final_output ? (
-              <div className="text-sm text-zinc-200 whitespace-pre-wrap bg-[#07080b] border border-[#1a1d24] rounded-lg p-4 leading-relaxed max-h-80 overflow-y-auto">
-                {session.final_output}
-              </div>
-            ) : (
-              <div className="text-xs text-zinc-500 bg-[#07080b] border border-[#1a1d24] rounded-lg p-4 flex items-center gap-2">
-                <CheckCircle2 className="w-4 h-4 text-zinc-600" />
-                El resumen final aparecerá aquí cuando los agentes concluyan.
-              </div>
-            )}
-          </div>
-        </div>
-
-        {/* Columna Derecha con Pestañas para evitar saturación */}
-        <div className="lg:col-span-5 bg-[#0c0d10] border border-[#1f222a] rounded-xl flex flex-col overflow-hidden min-h-[420px]">
-          <div className="flex border-b border-[#1f222a] bg-[#08090c]">
-            <button
-              type="button"
-              onClick={() => setInspectorTab("logs")}
-              className={`flex-1 py-3 px-4 text-xs font-medium flex items-center justify-center gap-2 border-b-2 transition cursor-pointer ${
-                inspectorTab === "logs"
-                  ? "border-indigo-500 text-white bg-[#0c0d10]"
-                  : "border-transparent text-zinc-500 hover:text-zinc-300"
-              }`}
-            >
-              <Terminal className="w-3.5 h-3.5 text-cyan-400" />
-              Actividad en Vivo ({events.length})
-            </button>
-            <button
-              type="button"
-              onClick={() => setInspectorTab("memory")}
-              className={`flex-1 py-3 px-4 text-xs font-medium flex items-center justify-center gap-2 border-b-2 transition cursor-pointer ${
-                inspectorTab === "memory"
-                  ? "border-indigo-500 text-white bg-[#0c0d10]"
-                  : "border-transparent text-zinc-500 hover:text-zinc-300"
-              }`}
-            >
-              <Layers className="w-3.5 h-3.5 text-emerald-400" />
-              Memoria Compartida ({blackboardEntries.length})
-            </button>
-          </div>
-
-          <div className="flex-1 p-4 overflow-y-auto max-h-[540px]">
-            {inspectorTab === "logs" ? (
-              events.length === 0 ? (
-                <div className="text-xs text-zinc-600 text-center py-12">
-                  Los eventos en tiempo real se mostrarán aquí durante la ejecución.
-                </div>
-              ) : (
-                <div className="space-y-2 font-mono text-[11px]">
-                  {events.map((ev, idx) => (
-                    <div
-                      key={ev.id || idx}
-                      className="p-2.5 rounded-lg bg-[#07080b] border border-[#171a22] flex items-start gap-2"
-                    >
-                      <Activity className="w-3.5 h-3.5 text-indigo-400 shrink-0 mt-0.5" />
-                      <div className="min-w-0">
-                        <div className="text-cyan-400 font-semibold">{ev.event_type}</div>
-                        {ev.payload && (
-                          <div className="text-zinc-400 break-all mt-0.5">
-                            {JSON.stringify(ev.payload)}
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )
-            ) : blackboardEntries.length === 0 ? (
-              <div className="text-xs text-zinc-600 text-center py-12">
-                Los agentes aún no han guardado notas en el Blackboard.
-              </div>
-            ) : (
-              <div className="space-y-3">
-                {blackboardEntries.map(([k, v]) => (
-                  <div
-                    key={k}
-                    className="rounded-lg bg-[#07080b] border border-[#1a1d24] p-3 space-y-1.5"
-                  >
-                    <div className="font-mono text-xs text-cyan-400 font-semibold">{k}</div>
-                    <div className="text-xs text-zinc-300 whitespace-pre-wrap leading-relaxed">
-                      {typeof v === "string" ? v : JSON.stringify(v, null, 2)}
-                    </div>
+        ) : (
+          <ol className="relative space-y-5">
+            {runs.map((run, idx) => {
+              const a = agentLabel(run.agent_id);
+              const s = statusInfo(run.status);
+              const isLast = idx === runs.length - 1;
+              return (
+                <li key={run.id} className="relative flex gap-4">
+                  {!isLast && <span className="absolute left-[19px] top-11 bottom-[-20px] w-px bg-cream-300" />}
+                  <div className="w-10 h-10 shrink-0 rounded-full bg-cream-100 border border-cream-200 flex items-center justify-center text-lg">
+                    {a.emoji}
                   </div>
-                ))}
-              </div>
-            )}
-          </div>
-        </div>
+                  <div className="min-w-0 flex-1 space-y-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-sm font-semibold text-ink-900">{a.name}</span>
+                      <span className={`text-[11px] px-2 py-0.5 rounded-full border ${TONE_CLASSES[s.tone]}`}>
+                        {s.label}
+                      </span>
+                    </div>
+                    <p className="text-sm text-ink-500 line-clamp-3 whitespace-pre-wrap">
+                      {run.result_summary || a.desc}
+                    </p>
+                    {run.error_message && (
+                      <div className={`mt-2 rounded-xl border px-3 py-2 text-xs ${TONE_CLASSES.rose}`}>
+                        {run.error_message}
+                      </div>
+                    )}
+                  </div>
+                </li>
+              );
+            })}
+          </ol>
+        )}
       </div>
+
+      {/* Resultado */}
+      <div className="card p-6 space-y-3">
+        <h2 className="text-sm font-semibold text-ink-900">Resultado final</h2>
+        {session.final_output ? (
+          <div className="text-sm text-ink-700 whitespace-pre-wrap leading-relaxed bg-white border border-cream-200 rounded-2xl p-5 max-h-96 overflow-y-auto">
+            {session.final_output}
+          </div>
+        ) : (
+          <p className="text-sm text-ink-500">El resumen aparecerá acá cuando los agentes terminen.</p>
+        )}
+      </div>
+
+      {/* Detalles (plegables) */}
+      <Section title="Notas que compartieron los agentes" count={blackboardEntries.length}>
+        {blackboardEntries.length === 0 ? (
+          <p className="text-sm text-ink-500">Todavía no guardaron notas.</p>
+        ) : (
+          <div className="space-y-3">
+            {blackboardEntries.map(([k, v]) => (
+              <div key={k} className="rounded-2xl bg-white border border-cream-200 p-4 space-y-1.5">
+                <div className="text-xs font-semibold text-sage-700 capitalize">{k.replace(/_/g, " ")}</div>
+                <div className="text-sm text-ink-700 whitespace-pre-wrap leading-relaxed">
+                  {typeof v === "string" ? v : JSON.stringify(v, null, 2)}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </Section>
+
+      <Section title="Actividad en vivo" count={visibleEvents.length}>
+        {visibleEvents.length === 0 ? (
+          <p className="text-sm text-ink-500">Los movimientos aparecerán acá en tiempo real.</p>
+        ) : (
+          <ul className="space-y-2 max-h-96 overflow-y-auto">
+            {visibleEvents.map((ev, idx) => (
+              <li key={ev.id || idx} className="flex items-start gap-3 text-sm">
+                <span className="mt-1.5 w-1.5 h-1.5 rounded-full bg-sage-500 shrink-0" />
+                <span className="text-ink-700">{describeEvent(ev)}</span>
+                {ev.timestamp && (
+                  <span className="ml-auto text-[11px] font-mono text-ink-300 shrink-0">
+                    {new Date(ev.timestamp).toLocaleTimeString()}
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </Section>
     </div>
   );
 }

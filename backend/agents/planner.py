@@ -1,4 +1,4 @@
-﻿import json
+import json
 from pathlib import Path
 from uuid import uuid4
 
@@ -25,7 +25,7 @@ class PlannedStageDTO(BaseModel):
 
 class GeneratedPlanDTO(BaseModel):
     rationale: str = Field(default="")
-    stages: list[PlannedStageDTO] = Field(min_length=1, max_length=5)
+    stages: list[PlannedStageDTO] = Field(min_length=1, max_length=6)
 
 
 class TaskPlanner:
@@ -110,7 +110,7 @@ class TaskPlanner:
 
         system_prompt = (
             "Eres el Arquitecto Planificador de AGENT LAB. "
-            "Tu única función es descomponer la solicitud del usuario en un pipeline secuencial de 1 a 4 etapas "
+            "Tu única función es descomponer la solicitud del usuario en un pipeline secuencial de 1 a 5 etapas "
             "asignando el agente especialista más adecuado a cada etapa.\n"
             "Responde EXCLUSIVAMENTE con un objeto JSON válido con este formato exacto:\n"
             '{"rationale": "breve explicación del plan", "stages": [{"node_id": "node_01_...", "agent_id": "...", "instruction": "..."}]}\n'

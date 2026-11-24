@@ -1,18 +1,147 @@
-﻿@import "tailwindcss";
+@import "tailwindcss";
+
+/* Paleta AGENT LAB: crema cálido + verde salvia + terracota suave */
+@theme {
+  --color-cream-50: #fdfaf4;
+  --color-cream-100: #f8f2e7;
+  --color-cream-200: #efe6d6;
+  --color-cream-300: #e3d6c0;
+
+  --color-ink-900: #2e2a25;
+  --color-ink-700: #4f4840;
+  --color-ink-500: #81776b;
+  --color-ink-300: #b5aa9b;
+
+  --color-sage-50: #eef3ec;
+  --color-sage-100: #dde8d9;
+  --color-sage-500: #6b8f62;
+  --color-sage-600: #57774f;
+  --color-sage-700: #45603f;
+
+  --color-clay-50: #fbefe7;
+  --color-clay-100: #f5dccb;
+  --color-clay-500: #c7774d;
+  --color-clay-700: #9a5332;
+
+  --color-rose-soft: #c8584f;
+
+  --font-sans: "Inter", system-ui, -apple-system, sans-serif;
+  --font-serif: "Fraunces", Georgia, serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
 
 @layer base {
   body {
-    background-color: #050507;
-    color: #f4f4f6;
-    font-family: "Inter", system-ui, -apple-system, sans-serif;
+    background-color: var(--color-cream-100);
+    color: var(--color-ink-900);
+    font-family: var(--font-sans);
   }
 
-  code, pre, .font-mono {
-    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  code,
+  pre,
+  .font-mono {
+    font-family: var(--font-mono);
+  }
+
+  ::selection {
+    background: var(--color-sage-100);
   }
 }
 
-.bg-dot-grid {
-  background-image: radial-gradient(#1f222a 1px, transparent 1px);
-  background-size: 20px 20px;
+@layer components {
+  .card {
+    background: var(--color-cream-50);
+    border: 1px solid var(--color-cream-200);
+    border-radius: 1.25rem;
+    box-shadow: 0 1px 2px rgb(46 42 37 / 0.04), 0 8px 24px -12px rgb(46 42 37 / 0.08);
+  }
+
+  .btn-primary {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    border-radius: 999px;
+    background: var(--color-sage-600);
+    color: white;
+    font-weight: 600;
+    font-size: 0.875rem;
+    padding: 0.7rem 1.4rem;
+    transition: background 0.15s, transform 0.15s;
+    cursor: pointer;
+  }
+  .btn-primary:hover:not(:disabled) {
+    background: var(--color-sage-700);
+  }
+  .btn-primary:active:not(:disabled) {
+    transform: scale(0.98);
+  }
+  .btn-primary:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
+  .btn-ghost {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.4rem;
+    border-radius: 999px;
+    border: 1px solid var(--color-cream-300);
+    background: var(--color-cream-50);
+    color: var(--color-ink-700);
+    font-weight: 500;
+    font-size: 0.8125rem;
+    padding: 0.55rem 1.1rem;
+    transition: background 0.15s, border-color 0.15s;
+    cursor: pointer;
+  }
+  .btn-ghost:hover:not(:disabled) {
+    background: var(--color-cream-200);
+  }
+  .btn-ghost:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
+  .input-soft {
+    width: 100%;
+    border-radius: 0.875rem;
+    border: 1px solid var(--color-cream-300);
+    background: white;
+    padding: 0.7rem 0.9rem;
+    font-size: 0.875rem;
+    color: var(--color-ink-900);
+    outline: none;
+    transition: border-color 0.15s, box-shadow 0.15s;
+  }
+  .input-soft:focus {
+    border-color: var(--color-sage-500);
+    box-shadow: 0 0 0 4px var(--color-sage-50);
+  }
+  .input-soft::placeholder {
+    color: var(--color-ink-300);
+  }
+}
+
+@keyframes soft-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
+}
+.animate-soft-pulse {
+  animation: soft-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes spin-slow {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.animate-spin-slow {
+  animation: spin-slow 1.2s linear infinite;
 }

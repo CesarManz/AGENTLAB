@@ -45,6 +45,17 @@ def create_app(db_path: str | Path = "data/agent_lab.db") -> FastAPI:
         allow_headers=["*"],
     )
 
+    def schedule_session_task(c: AppContainer, session_id: UUID, coro: Any) -> None:
+        sid = str(session_id)
+        task = asyncio.create_task(coro)
+        c.running_tasks[sid] = task
+
+        def _cleanup(_t: asyncio.Task[Any]) -> None:
+            if c.running_tasks.get(sid) is _t:
+                c.running_tasks.pop(sid, None)
+
+        task.add_done_callback(_cleanup)
+
     def get_container(request: Request) -> AppContainer:
         return request.app.state.container
 
@@ -161,7 +172,7 @@ def create_app(db_path: str | Path = "data/agent_lab.db") -> FastAPI:
             max_budget_tokens=body.max_budget_tokens,
         )
         session.git_checkpoint = GitSafetyManager(session.workspace_path).create_checkpoint(str(session.id))
-        background_tasks.add_task(c.engine.execute_session, session, body.agent_id)
+        schedule_session_task(c, session.id, c.engine.execute_session(session, body.agent_id))
 
         return {
             "session_id": str(session.id),
@@ -189,7 +200,7 @@ def create_app(db_path: str | Path = "data/agent_lab.db") -> FastAPI:
             session.blackboard["ast_code_graph"] = kg.render_compact_map()
         stages, rationale = await c.planner.build_plan(session)
         session.blackboard["planner_rationale"] = rationale
-        background_tasks.add_task(c.orchestrator.run_pipeline, session, stages)
+        schedule_session_task(c, session.id, c.orchestrator.run_pipeline(session, stages))
         return {
             "session_id": str(session.id),
             "ws_url": f"/ws/sessions/{session.id}",
@@ -222,7 +233,7 @@ def create_app(db_path: str | Path = "data/agent_lab.db") -> FastAPI:
             workspace_path=body.get("workspace_path", "data/default_workspace"),
             max_budget_tokens=body.get("max_budget_tokens", 25_000),
         )
-        background_tasks.add_task(c.orchestrator.run_pipeline, session, stages)
+        schedule_session_task(c, session.id, c.orchestrator.run_pipeline(session, stages))
         return {
             "session_id": str(session.id),
             "ws_url": f"/ws/sessions/{session.id}",
@@ -266,6 +277,29 @@ def create_app(db_path: str | Path = "data/agent_lab.db") -> FastAPI:
         mgr = GitSafetyManager(session.workspace_path)
         res = mgr.rollback_mission(session.git_checkpoint)
         return res.model_dump(mode="json")
+
+    @app.post("/sessions/{session_id}/stop")
+    async def stop_session(session_id: UUID, request: Request) -> dict[str, Any]:
+        c = get_container(request)
+        sid = str(session_id)
+        task = c.running_tasks.get(sid)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=0.4)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                pass
+        c.repo.interrupt_session(session_id)
+        updated_session = c.repo.get_session(session_id)
+        if updated_session is None:
+            raise HTTPException(status_code=404, detail="Sesión no encontrada")
+        runs = c.repo.list_runs_for_session(session_id)
+        pending = c.repo.list_pending_approvals(session_id)
+        return {
+            "session": updated_session.model_dump(mode="json"),
+            "runs": [r.model_dump(mode="json") for r in runs],
+            "pending_approvals": [p.model_dump(mode="json") for p in pending],
+        }
 
     @app.post("/sessions/{session_id}/resume")
     async def resume_session(session_id: UUID, request: Request) -> dict[str, Any]:

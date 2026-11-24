@@ -245,3 +245,8 @@ export async function clearSessions(): Promise<{ deleted_count: number }> {
   if (!res.ok) throw new Error("No se pudo limpiar el historial");
   return res.json();
 }
+export async function stopSession(sessionId: string): Promise<SessionStateResponse> {
+  const res = await fetch(`${API_BASE}/sessions/${sessionId}/stop`, { method: "POST" });
+  if (!res.ok) throw new Error("No se pudo detener la misión");
+  return res.json();
+}

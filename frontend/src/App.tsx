@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   Activity,
-  Cpu,
+  Leaf,
   FolderOpen,
   History,
   PlusCircle,
@@ -22,6 +22,7 @@ import {
   resolveApproval,
   resumeSession,
   rollbackSession,
+  stopSession,
   type HealthResponse,
   type SessionStateResponse,
   type SystemEventDTO,
@@ -221,6 +222,28 @@ export function App() {
     }
   }
 
+  async function handleStop() {
+    if (!sessionState) return;
+    setIsSafetyBusy(true);
+    setSafetyBanner(null);
+    try {
+      const updated = await stopSession(sessionState.session.id);
+      setSessionState(updated);
+      setSafetyBanner({
+        kind: "warn",
+        text: "Detuviste la tarea. Podés continuarla o deshacer los cambios cuando quieras.",
+      });
+      await refreshOverview();
+    } catch (err) {
+      setSafetyBanner({
+        kind: "warn",
+        text: err instanceof Error ? err.message : "No se pudo detener la misión",
+      });
+    } finally {
+      setIsSafetyBusy(false);
+    }
+  }
+
   async function handleResume() {
     if (!sessionState) return;
     setIsSafetyBusy(true);
@@ -243,49 +266,36 @@ export function App() {
   const pendingAttentionCount =
     (sessionState?.pending_approvals.length ?? 0) || globalPending.length;
 
-  const navItems: { id: ViewTab; label: string; icon: typeof PlusCircle; badge?: string }[] = [
-    { id: "launch", label: "Nueva Misión", icon: PlusCircle },
+  const navItems: { id: ViewTab; label: string; icon: typeof PlusCircle; badge?: string; alert?: boolean }[] = [
+    { id: "launch", label: "Nueva tarea", icon: PlusCircle },
     {
       id: "live",
-      label: "Misión en Vivo",
+      label: "En curso",
       icon: Activity,
-      badge: pendingAttentionCount > 0 ? `${pendingAttentionCount} HITL` : undefined,
+      badge: pendingAttentionCount > 0 ? String(pendingAttentionCount) : undefined,
+      alert: pendingAttentionCount > 0,
     },
-    {
-      id: "files",
-      label: "Archivos Workspace",
-      icon: FolderOpen,
-      badge: wsFiles.length > 0 ? String(wsFiles.length) : undefined,
-    },
-    {
-      id: "history",
-      label: "Historial & Métricas",
-      icon: History,
-      badge: sessions.length > 0 ? String(sessions.length) : undefined,
-    },
+    { id: "files", label: "Archivos", icon: FolderOpen },
+    { id: "history", label: "Historial", icon: History },
   ];
 
   return (
-    <div className="min-h-screen bg-[#050507] text-[#f4f4f6] flex">
-      {/* Sidebar Limpio */}
-      <aside className="w-64 shrink-0 sticky top-0 h-screen overflow-y-auto border-r border-[#1f222a] bg-[#08090c] flex flex-col justify-between select-none">
-        <div>
-          <div className="h-14 px-5 border-b border-[#1f222a] flex items-center justify-between">
-            <div className="flex items-center gap-2.5">
-              <div className="w-7 h-7 rounded-lg bg-indigo-500/15 border border-indigo-500/30 flex items-center justify-center text-indigo-400">
-                <Cpu className="w-4 h-4" />
-              </div>
-              <span className="font-semibold text-sm tracking-tight text-white">AGENT LAB</span>
-            </div>
-            <span className="font-mono text-[10px] px-2 py-0.5 rounded-full bg-[#13151a] border border-[#1f222a] text-cyan-400">
-              v0.9
+    <div className="min-h-screen bg-cream-100 text-ink-900 flex flex-col">
+      {/* Barra superior */}
+      <header className="sticky top-0 z-20 bg-cream-100/85 backdrop-blur border-b border-cream-200">
+        <div className="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between gap-4">
+          <button
+            type="button"
+            onClick={() => setActiveTab("launch")}
+            className="flex items-center gap-2.5 cursor-pointer"
+          >
+            <span className="w-8 h-8 rounded-full bg-sage-600 text-cream-50 flex items-center justify-center">
+              <Leaf className="w-4 h-4" />
             </span>
-          </div>
+            <span className="font-serif text-lg text-ink-900 tracking-tight">Agent Lab</span>
+          </button>
 
-          <div className="px-5 pt-5 pb-2 font-mono text-[10px] uppercase tracking-wider text-zinc-500">
-            Espacios de Trabajo
-          </div>
-          <nav className="px-3 space-y-1">
+          <nav className="flex items-center gap-1 bg-cream-50 border border-cream-200 rounded-full p-1">
             {navItems.map((item) => {
               const Icon = item.icon;
               const active = activeTab === item.id;
@@ -294,22 +304,16 @@ export function App() {
                   key={item.id}
                   type="button"
                   onClick={() => setActiveTab(item.id)}
-                  className={`w-full flex items-center justify-between px-3 py-2.5 rounded-lg text-xs transition cursor-pointer ${
-                    active
-                      ? "bg-[#141720] text-white border border-[#282d3b] font-medium"
-                      : "text-zinc-400 hover:text-zinc-200 hover:bg-[#0e1015]"
+                  className={`relative flex items-center gap-2 px-3.5 py-1.5 rounded-full text-sm transition cursor-pointer ${
+                    active ? "bg-ink-900 text-cream-50" : "text-ink-700 hover:bg-cream-200"
                   }`}
                 >
-                  <span className="flex items-center gap-2.5">
-                    <Icon className={`w-4 h-4 ${active ? "text-indigo-400" : "text-zinc-500"}`} />
-                    {item.label}
-                  </span>
+                  <Icon className="w-4 h-4" />
+                  <span className="hidden sm:inline">{item.label}</span>
                   {item.badge && (
                     <span
-                      className={`font-mono text-[10px] px-1.5 py-0.5 rounded ${
-                        item.badge.includes("HITL")
-                          ? "bg-amber-500/20 text-amber-300 border border-amber-500/35"
-                          : "bg-[#13151a] text-zinc-400"
+                      className={`min-w-5 h-5 px-1.5 rounded-full text-[10px] font-semibold flex items-center justify-center ${
+                        item.alert ? "bg-clay-500 text-white animate-soft-pulse" : "bg-cream-200 text-ink-700"
                       }`}
                     >
                       {item.badge}
@@ -320,51 +324,29 @@ export function App() {
             })}
           </nav>
 
-          {/* Agentes Registrados */}
-          <div className="px-5 pt-6 pb-2 font-mono text-[10px] uppercase tracking-wider text-zinc-500">
-            Equipo Disponible ({health?.agents.length ?? 0})
-          </div>
-          <div className="px-3 space-y-1.5">
-            {(health?.agents ?? []).map((ag) => (
-              <div
-                key={ag.id}
-                className="px-3 py-2 rounded-lg bg-[#0c0d10] border border-[#1a1d24] flex items-center justify-between"
-              >
-                <div className="truncate">
-                  <div className="text-xs font-medium text-zinc-200 capitalize">{ag.id}</div>
-                  <div className="text-[10px] text-zinc-500 truncate">{ag.role}</div>
-                </div>
-                <span className="w-2 h-2 rounded-full bg-emerald-400 shrink-0" />
-              </div>
-            ))}
+          <div
+            className="hidden md:flex items-center gap-2 text-xs text-ink-500"
+            title={health ? `${health.agents.length} agentes y ${health.tools.length} herramientas disponibles` : ""}
+          >
+            <span className={`w-2 h-2 rounded-full ${health ? "bg-sage-500" : "bg-rose-soft"}`} />
+            {health ? `${health.agents.length} agentes listos` : "Sin conexión"}
           </div>
         </div>
+      </header>
 
-        {/* Estado del Servidor */}
-        <div className="p-4 border-t border-[#1f222a] bg-[#060709] space-y-1.5 font-mono text-[11px]">
-          <div className="flex items-center justify-between">
-            <span className="flex items-center gap-2 text-zinc-300">
-              <span
-                className={`w-2 h-2 rounded-full ${
-                  health ? "bg-emerald-400 animate-pulse" : "bg-rose-500"
-                }`}
-              />
-              {health ? "Servidor Activo" : "Desconectado"}
-            </span>
+      {/* Contenido */}
+      <div className="flex-1">
+        {!health && (
+          <div className="max-w-3xl mx-6 md:mx-auto mt-6 px-5 py-4 rounded-2xl bg-clay-50 border border-clay-100 text-sm text-clay-700">
+            <strong>No podemos conectarnos con el servidor.</strong> Asegurate de haber iniciado el backend
+            (ejecutá <code className="font-mono text-xs">.\dev.ps1</code>) y recargá la página.
           </div>
-          <div className="flex items-center justify-between text-[10px] text-zinc-500">
-            <span>Herramientas</span>
-            <span className="text-cyan-400">{health?.tools.length ?? 0} activas</span>
-          </div>
-        </div>
-      </aside>
+        )}
 
-      {/* Área Principal */}
-      <div className="flex-1 flex flex-col min-w-0">
         {errorMsg && (
-          <div className="mx-6 mt-4 px-4 py-3 rounded-lg bg-rose-500/10 border border-rose-500/30 text-xs text-rose-300 flex items-center justify-between">
+          <div className="max-w-3xl mx-auto mt-6 px-5 py-3.5 rounded-2xl bg-[#fbeceb] border border-[#f2d3d0] text-sm text-rose-soft flex items-center justify-between gap-4">
             <span>{errorMsg}</span>
-            <button type="button" onClick={() => setErrorMsg(null)} className="text-rose-400 cursor-pointer">
+            <button type="button" onClick={() => setErrorMsg(null)} className="cursor-pointer" title="Cerrar">
               <X className="w-4 h-4" />
             </button>
           </div>
@@ -374,6 +356,7 @@ export function App() {
           <MissionLauncher
             mode={mode}
             setMode={setMode}
+            agents={health?.agents ?? []}
             agentId={agentId}
             setAgentId={setAgentId}
             workspacePath={workspacePath}
@@ -402,6 +385,7 @@ export function App() {
             onResume={handleResume}
             onNewMission={() => setActiveTab("launch")}
             onRetryMission={() => handleLaunch(sessionState?.session.user_prompt)}
+            onStopMission={handleStop}
           />
         )}
 

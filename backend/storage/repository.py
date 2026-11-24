@@ -143,6 +143,20 @@ class StorageRepository:
             cur = conn.execute("DELETE FROM task_sessions WHERE status != 'running'")
             return cur.rowcount
 
+    def interrupt_session(self, session_id: UUID) -> bool:
+        sid = str(session_id)
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE agent_runs SET status = 'interrupted', error_message = 'Detenida manualmente por el usuario.' "
+                "WHERE session_id = ? AND status IN ('running', 'awaiting_approval', 'pending')",
+                (sid,),
+            )
+            cur = conn.execute(
+                "UPDATE task_sessions SET status = 'interrupted' WHERE id = ? AND status IN ('running', 'awaiting_approval', 'pending')",
+                (sid,),
+            )
+            return cur.rowcount > 0
+
     def recover_interrupted_sessions(self) -> list[UUID]:
         """
         Reconcilia sesiones y ejecuciones que quedaron en estado 'running' tras un cierre
